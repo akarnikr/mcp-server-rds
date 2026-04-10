@@ -121,6 +121,29 @@ export class McpServerService implements OnApplicationShutdown {
               additionalProperties: false,
             },
           },
+          {
+            name: "get_base_theme_guidelines",
+            description:
+              "Returns cached/scraped Foundations Base Theme guidelines from RDS Storybook.",
+            inputSchema: {
+              type: "object",
+              properties: {},
+              additionalProperties: false,
+            },
+          },
+          {
+            name: "validate_theme_compliance",
+            description:
+              "Validates a webpage against RDS base theme color and typography guidelines.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                url: { type: "string" },
+              },
+              required: ["url"],
+              additionalProperties: false,
+            },
+          },
         ],
       };
     });
@@ -197,6 +220,27 @@ export class McpServerService implements OnApplicationShutdown {
             const component =
               typeof args?.component === "string" ? args.component : "";
             const result = await this.scraperService.getComponentMetadata(component);
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
+          if (name === "get_base_theme_guidelines") {
+            const run = await this.scraperService.getBaseThemeGuidelines();
+            const result = {
+              baseTheme: run.data,
+              fromCache: run.fromCache,
+              updatedAt: run.data.updatedAt,
+              warnings: run.warnings,
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
+          if (name === "validate_theme_compliance") {
+            const url = typeof args?.url === "string" ? args.url : "";
+            const result = await this.scraperService.validateThemeCompliance(url);
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
             };

@@ -51,11 +51,13 @@ mcp-server-rds/
 
 ## 4.2 `McpModule`
 - Provides MCP server initializer (`mcp.server.ts`).
-- Registers 4 tools:
+- Registers 6 tools:
   - `list_rds_components`
   - `generate_rds_component`
   - `refresh_rds_cache`
   - `get_component_details`
+  - `get_base_theme_guidelines`
+  - `validate_theme_compliance`
 
 ## 4.3 `ScraperModule`
 - Provides `ScraperService`, `ParserService`, `CacheService`.
@@ -100,6 +102,9 @@ type CachedRdsData = {
   sourceSite: string; // https://rds-vue-ui.edpl.us/
   components: RdsComponentRecord[];
   detailsById: Record<string, ParsedComponentData>;
+  themes?: {
+    baseTheme: BaseThemeGuidelines;
+  };
 };
 ```
 
@@ -233,6 +238,62 @@ type RdsComponentMetadata = {
 };
 ```
 
+## 8.5 `get_base_theme_guidelines`
+- Input: none
+- Behavior:
+  - resolve fresh cache theme payload when available
+  - otherwise scrape Storybook `index.json` for `Foundations/Base Theme` story ids
+  - scrape corresponding `iframe.html?id=<storyId>&viewMode=story` pages
+  - extract CSS variables/text/color values/typography families and persist in cache
+- Output JSON:
+```ts
+{
+  baseTheme: BaseThemeGuidelines;
+  fromCache: boolean;
+  updatedAt: string;
+  warnings: string[];
+}
+```
+
+## 8.6 `validate_theme_compliance`
+- Input schema:
+```ts
+{ url: string }
+```
+- Behavior:
+  - validate absolute `http`/`https` URL
+  - load base theme guidelines (cache-first)
+  - scan target page computed styles via Playwright
+  - validate colors and font families against base theme reference sets
+- Output:
+```ts
+type ThemeComplianceReport = {
+  url: string;
+  checkedAt: string;
+  fromThemeCache: boolean;
+  summary: {
+    totalElementsScanned: number;
+    totalViolations: number;
+    score: number; // 0..1
+    compliant: boolean;
+  };
+  checks: Array<{ id: string; status: "pass" | "fail"; message: string }>;
+  violations: Array<{
+    type: "color" | "typography";
+    property: string;
+    value: string;
+    element: string;
+    message: string;
+  }>;
+  warnings: string[];
+  themeReference: {
+    storyCount: number;
+    storyIds: string[];
+    updatedAt: string;
+  };
+};
+```
+
 ## 9. Logging and Error Policy
 - All logs must use `console.error`.
 - Do not print operational logs to stdout.
@@ -265,6 +326,8 @@ type RdsComponentMetadata = {
 - `generate_rds_component` returns raw text blob with code and props.
 - `refresh_rds_cache` returns summary JSON and writes cache.
 - `get_component_details` returns enriched metadata for a valid component.
+- `get_base_theme_guidelines` returns base theme payload from cache/live scrape.
+- `validate_theme_compliance` returns pass/fail report for valid URL input.
 
 ## 11.3 Runtime checks
 - Stdio mode launches with clean stdout protocol behavior.

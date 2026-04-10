@@ -12,6 +12,8 @@ Provide an MCP server that exposes tools for:
 - generating component code and props details from docs
 - refreshing a local cache from live docs
 - returning enriched component metadata from docs/cache/npm
+- returning base theme guidelines from Storybook
+- validating webpage compliance against base theme styling rules
 
 ## Audience
 - AI assistants and agent workflows using MCP
@@ -58,6 +60,25 @@ Provide an MCP server that exposes tools for:
   - completeness scoring (`metadataCompleteness`)
   - warnings list (`warnings`)
 
+### 5) `get_base_theme_guidelines`
+- Input: none.
+- Scrapes/returns cached Storybook `Foundations/Base Theme` stories (`foundations-base-theme--*`).
+- Returns structured guidance for:
+  - color palette/tokens
+  - typography families/tokens
+  - spacing/breakpoints/containers tokens when available
+  - utility classes and background pattern notes
+- Includes source story IDs/URLs and warning metadata for partial extraction.
+
+### 6) `validate_theme_compliance`
+- Input: `url` (absolute `http`/`https` webpage URL).
+- Uses base theme guidelines as policy reference.
+- Scans page computed styles (color/background/border/font-family) and reports:
+  - compliance summary (`score`, `compliant`, counts)
+  - rule-level checks (`base-theme-colors`, `base-theme-typography`)
+  - explicit violations with element/property/value context
+  - warnings for capped output or fallback behavior
+
 ## Scraping and Performance Requirements
 - Use Playwright Chromium.
 - Do not block fonts/images/assets; page must fully load brand assets.
@@ -70,6 +91,7 @@ Provide an MCP server that exposes tools for:
 - Cache file path: `.cache/rds-data.json`.
 - Cache TTL: 24 hours.
 - If refresh fails, serve stale cache when available, with warning metadata.
+- Cache also stores `themes.baseTheme` with scraped Storybook base-theme guidance.
 
 ## Runtime/Transport Requirements
 - Dual mode startup:
@@ -97,12 +119,16 @@ Provide an MCP server that exposes tools for:
 - MCP client can request component generation by slug and get code+props blob.
 - Cache refresh runs in batched mode and reports summary JSON.
 - MCP client can request enriched component metadata by component id.
+- MCP client can request base-theme styling guidance from Storybook.
+- MCP client can validate a webpage against base-theme styling compliance rules.
 - Server supports both stdio and SSE startup modes.
 - Scraper cleans up contexts/browser and does not leak resources across requests.
 
 ## Acceptance Checklist
-- [ ] All four MCP tools are implemented and callable.
+- [ ] All six MCP tools are implemented and callable.
 - [ ] Cache freshness and forced refresh logic works as specified.
 - [ ] Batch size, delay, timeout, and context lifecycle requirements are met.
+- [ ] Base theme scraping and cache persistence are operational.
+- [ ] Theme compliance validation returns deterministic violations for non-compliant pages.
 - [ ] SSE defaults and stdio fallback behavior are implemented.
 - [ ] Logging and shutdown behavior follow requirements.

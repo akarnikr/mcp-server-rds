@@ -1,6 +1,6 @@
 # Implementation Phases
 
-This document breaks implementation into 4 executable phases. It is derived from:
+This document breaks implementation into 5 executable phases. It is derived from:
 - `docs/PRD.md`
 - `docs/IMPLEMENTATION_SPEC.md`
 
@@ -9,12 +9,14 @@ This document breaks implementation into 4 executable phases. It is derived from
 - `docs/PHASE_2_SCRAPER_AND_CACHE.md`
 - `docs/PHASE_3_PARSER_AND_TOOLS.md`
 - `docs/PHASE_4_HARDENING_AND_VERIFICATION.md`
+- `docs/PHASE_5_THEME_GUIDELINES_AND_COMPLIANCE.md`
 
 ## Sequence and Exit Gates
 1. Complete Phase 1 and pass all exit criteria before Phase 2.
 2. Complete Phase 2 and pass all exit criteria before Phase 3.
 3. Complete Phase 3 and pass all exit criteria before Phase 4.
-4. Complete Phase 4 to reach implementation-ready and review-ready status.
+4. Complete Phase 4 and pass all exit criteria before Phase 5.
+5. Complete Phase 5 to reach implementation-ready and review-ready status.
 
 ## Cross-Phase Invariants
 - `console.error` is used for operational logging; stdout remains protocol-clean.
@@ -24,6 +26,8 @@ This document breaks implementation into 4 executable phases. It is derived from
   - `generate_rds_component`
   - `refresh_rds_cache`
   - `get_component_details`
+  - `get_base_theme_guidelines`
+  - `validate_theme_compliance`
 - Cache path and TTL remain fixed:
   - `.cache/rds-data.json`
   - 24 hours

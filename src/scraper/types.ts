@@ -20,6 +20,9 @@ export type CachedRdsData = {
   sourceSite: string;
   components: RdsComponentRecord[];
   detailsById: Record<string, ParsedComponentData>;
+  themes?: {
+    baseTheme: BaseThemeGuidelines;
+  };
 };
 
 export type ScrapeRunResult = {
@@ -69,4 +72,75 @@ export type RdsComponentMetadata = {
     missing: string[];
   };
   warnings: string[];
+};
+
+export type BaseThemeStoryGuideline = {
+  storyId: string;
+  title: string;
+  name: string;
+  url: string;
+  iframeUrl: string;
+  extractedText: string[];
+  cssVariables: Record<string, string>;
+  colors: string[];
+  typographyFamilies: string[];
+  warnings?: string[];
+};
+
+export type BaseThemeGuidelines = {
+  updatedAt: string;
+  sourceSite: string;
+  sourceIndexUrl: string;
+  storyCount: number;
+  storyIds: string[];
+  stories: BaseThemeStoryGuideline[];
+  colorTokens: Record<string, string>;
+  typographyTokens: Record<string, string>;
+  spacingTokens: Record<string, string>;
+  breakpoints: Record<string, string>;
+  utilityClasses: string[];
+  backgroundPatterns: string[];
+  colorValues: string[];
+  typographyFamilies: string[];
+  notes: string[];
+};
+
+export type BaseThemeRunResult = {
+  data: BaseThemeGuidelines;
+  fromCache: boolean;
+  usedStaleCache: boolean;
+  warnings: string[];
+  durationMs: number;
+};
+
+export type ThemeComplianceViolation = {
+  type: "color" | "typography";
+  property: string;
+  value: string;
+  element: string;
+  message: string;
+};
+
+export type ThemeComplianceReport = {
+  url: string;
+  checkedAt: string;
+  fromThemeCache: boolean;
+  summary: {
+    totalElementsScanned: number;
+    totalViolations: number;
+    score: number;
+    compliant: boolean;
+  };
+  checks: Array<{
+    id: string;
+    status: "pass" | "fail";
+    message: string;
+  }>;
+  violations: ThemeComplianceViolation[];
+  warnings: string[];
+  themeReference: {
+    storyCount: number;
+    storyIds: string[];
+    updatedAt: string;
+  };
 };

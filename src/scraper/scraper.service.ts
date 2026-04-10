@@ -5,23 +5,30 @@ import { CacheService } from "../common/cache.service.js";
 import { ParserService } from "./parser.service.js";
 import type {
   CachedRdsData,
+  BaseThemeGuidelines,
+  BaseThemeRunResult,
   ParsedComponentData,
   RdsComponentMetadata,
   RdsComponentRecord,
   RdsStoryRecord,
   ScrapeRunResult,
   ScrapedPagePayload,
+  ThemeComplianceReport,
+  ThemeComplianceViolation,
 } from "./types.js";
 
 const DOCS_ROOT_URL = "https://rds-vue-ui.edpl.us/";
 const INDEX_JSON_URL = new URL("index.json", DOCS_ROOT_URL).toString();
 const NAV_PATH_FRAGMENT = "/components/";
-const CACHE_SCHEMA_VERSION = 2;
+const BASE_THEME_TITLE = "Foundations/Base Theme";
+const BASE_THEME_STORY_PREFIX = "foundations-base-theme--";
+const CACHE_SCHEMA_VERSION = 3;
 const GENERIC_INSTALL_FALLBACK =
   "yarn add --registry=https://npm.edpl.us @rds-vue-ui/<component-package>";
 const BATCH_SIZE = 3;
 const INTER_BATCH_DELAY_MS = 1000;
 const PAGE_TIMEOUT_MS = 20_000;
+const MAX_VALIDATION_ELEMENTS = 1500;
 
 @Injectable()
 export class ScraperService implements OnApplicationShutdown {
@@ -192,6 +199,222 @@ export class ScraperService implements OnApplicationShutdown {
     return metadata;
   }
 
+  async getBaseThemeGuidelines(
+    options?: { forceRefresh?: boolean },
+  ): Promise<BaseThemeRunResult> {
+    const startedAt = Date.now();
+    const forceRefresh = options?.forceRefresh ?? false;
+
+    if (!forceRefresh) {
+      const freshCache = await this.cacheService.getFreshCache();
+      const cachedTheme = freshCache?.themes?.baseTheme;
+      if (cachedTheme) {
+        return {
+          data: cachedTheme,
+          fromCache: true,
+          usedStaleCache: false,
+          warnings: [],
+          durationMs: Date.now() - startedAt,
+        };
+      }
+    }
+
+    const staleCache = await this.cacheService.readCache();
+    const staleTheme = staleCache?.themes?.baseTheme ?? null;
+
+    try {
+      const browser = await this.getBrowser();
+      const extracted = await this.scrapeBaseThemeGuidelines(browser);
+      await this.upsertBaseThemeCache(extracted.guidelines);
+
+      return {
+        data: extracted.guidelines,
+        fromCache: false,
+        usedStaleCache: false,
+        warnings: extracted.warnings,
+        durationMs: Date.now() - startedAt,
+      };
+    } catch (error) {
+      console.error("Failed to scrape base theme guidelines:", error);
+      if (staleTheme) {
+        return {
+          data: staleTheme,
+          fromCache: true,
+          usedStaleCache: true,
+          warnings: [
+            "Live base theme scrape failed; stale cached base theme served.",
+          ],
+          durationMs: Date.now() - startedAt,
+        };
+      }
+      throw error;
+    }
+  }
+
+  async validateThemeCompliance(
+    pageUrl: string,
+  ): Promise<ThemeComplianceReport | { error: string }> {
+    const normalizedUrl = this.normalizeExternalUrl(pageUrl);
+    if (!normalizedUrl) {
+      return { error: `Invalid url: ${pageUrl}` };
+    }
+
+    const themeRun = await this.getBaseThemeGuidelines();
+    const baseTheme = themeRun.data;
+    const warnings = [...themeRun.warnings];
+
+    const allowedColorValues = new Set(
+      baseTheme.colorValues
+        .map((value) => this.normalizeColor(value))
+        .filter((value): value is string => Boolean(value)),
+    );
+    const allowedFontFamilies = new Set(
+      baseTheme.typographyFamilies.map((family) => family.toLowerCase()),
+    );
+
+    const browser = await this.getBrowser();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    try {
+      await page.goto(normalizedUrl, {
+        waitUntil: "networkidle",
+        timeout: PAGE_TIMEOUT_MS,
+      });
+
+      const styleSnapshot = await page.evaluate((limit) => {
+        const doc = (globalThis as any).document;
+        const win = (globalThis as any).window;
+        const elements = (Array.from(doc.querySelectorAll("*")) as any[]).slice(0, limit);
+        return elements.map((element) => {
+          const computed = win.getComputedStyle(element);
+          const descriptor = {
+            tag: element.tagName.toLowerCase(),
+            id: element.id || "",
+            className: element.className || "",
+          };
+          return {
+            element: `${descriptor.tag}${descriptor.id ? `#${descriptor.id}` : ""}${descriptor.className ? `.${String(descriptor.className).trim().replace(/\s+/g, ".")}` : ""}`,
+            color: computed.color,
+            backgroundColor: computed.backgroundColor,
+            borderTopColor: computed.borderTopColor,
+            borderRightColor: computed.borderRightColor,
+            borderBottomColor: computed.borderBottomColor,
+            borderLeftColor: computed.borderLeftColor,
+            fontFamily: computed.fontFamily,
+            fontSize: computed.fontSize,
+          };
+        });
+      }, MAX_VALIDATION_ELEMENTS);
+
+      const violations: ThemeComplianceViolation[] = [];
+      const colorsToCheck = [
+        "color",
+        "backgroundColor",
+        "borderTopColor",
+        "borderRightColor",
+        "borderBottomColor",
+        "borderLeftColor",
+      ] as const;
+
+      for (const item of styleSnapshot) {
+        for (const property of colorsToCheck) {
+          const normalized = this.normalizeColor(item[property]);
+          if (!normalized || this.isIgnorableColor(normalized)) {
+            continue;
+          }
+          if (!allowedColorValues.has(normalized)) {
+            violations.push({
+              type: "color",
+              property,
+              value: item[property],
+              element: item.element,
+              message: `${property} uses a color not found in base theme palette tokens.`,
+            });
+          }
+        }
+
+        const normalizedFamily = this.normalizeFontFamily(item.fontFamily);
+        if (normalizedFamily && !allowedFontFamilies.has(normalizedFamily)) {
+          violations.push({
+            type: "typography",
+            property: "fontFamily",
+            value: item.fontFamily,
+            element: item.element,
+            message: "fontFamily is not present in base theme typography guidelines.",
+          });
+        }
+      }
+
+      const cappedViolations = violations.slice(0, 200);
+      if (violations.length > cappedViolations.length) {
+        warnings.push(
+          `Violation output capped at ${cappedViolations.length} records (found ${violations.length}).`,
+        );
+      }
+
+      const checks = [
+        {
+          id: "base-theme-colors",
+          status:
+            cappedViolations.some((item) => item.type === "color") ? "fail" : "pass",
+          message:
+            cappedViolations.some((item) => item.type === "color")
+              ? "Found colors outside base theme palette tokens."
+              : "All scanned colors matched base theme palette tokens.",
+        },
+        {
+          id: "base-theme-typography",
+          status:
+            cappedViolations.some((item) => item.type === "typography")
+              ? "fail"
+              : "pass",
+          message:
+            cappedViolations.some((item) => item.type === "typography")
+              ? "Found font families outside base theme typography guidance."
+              : "All scanned font families matched base theme typography guidance.",
+        },
+      ] as const;
+
+      const totalElementsScanned = styleSnapshot.length;
+      const totalViolations = violations.length;
+      const scoreRaw =
+        totalElementsScanned === 0
+          ? 1
+          : 1 - totalViolations / Math.max(totalElementsScanned * 2, 1);
+      const score = Number(Math.max(0, Math.min(1, scoreRaw)).toFixed(2));
+
+      return {
+        url: normalizedUrl,
+        checkedAt: new Date().toISOString(),
+        fromThemeCache: themeRun.fromCache,
+        summary: {
+          totalElementsScanned,
+          totalViolations,
+          score,
+          compliant: totalViolations === 0,
+        },
+        checks: checks.map((check) => ({
+          ...check,
+          status: check.status as "pass" | "fail",
+        })),
+        violations: cappedViolations,
+        warnings,
+        themeReference: {
+          storyCount: baseTheme.storyCount,
+          storyIds: baseTheme.storyIds,
+          updatedAt: baseTheme.updatedAt,
+        },
+      };
+    } catch (error) {
+      console.error(`Failed to validate theme compliance for ${normalizedUrl}:`, error);
+      return { error: `Unable to validate url: ${normalizedUrl}` };
+    } finally {
+      await page.close();
+      await context.close();
+    }
+  }
+
   private async runLiveRefresh(startedAt: number): Promise<ScrapeRunResult> {
     const staleCache = await this.cacheService.readCache();
 
@@ -203,6 +426,7 @@ export class ScraperService implements OnApplicationShutdown {
       }
       const { payloads: pagePayloads, warnings } =
         await this.scrapeComponentPages(browser, components);
+      const themeResult = await this.scrapeBaseThemeGuidelines(browser);
 
       const detailsById: CachedRdsData["detailsById"] = {};
       for (const payload of pagePayloads) {
@@ -215,6 +439,9 @@ export class ScraperService implements OnApplicationShutdown {
         sourceSite: DOCS_ROOT_URL,
         components,
         detailsById,
+        themes: {
+          baseTheme: themeResult.guidelines,
+        },
       };
 
       await this.cacheService.writeCache(data);
@@ -223,7 +450,7 @@ export class ScraperService implements OnApplicationShutdown {
         data,
         fromCache: false,
         usedStaleCache: false,
-        warnings,
+        warnings: [...warnings, ...themeResult.warnings],
         durationMs: Date.now() - startedAt,
       };
     } catch (error) {
@@ -677,6 +904,29 @@ export class ScraperService implements OnApplicationShutdown {
     await this.cacheService.writeCache(data);
   }
 
+  private async upsertBaseThemeCache(theme: BaseThemeGuidelines): Promise<void> {
+    const existing = await this.cacheService.readCache();
+    const data: CachedRdsData = existing ?? {
+      schemaVersion: CACHE_SCHEMA_VERSION,
+      updatedAt: new Date().toISOString(),
+      sourceSite: DOCS_ROOT_URL,
+      components: [],
+      detailsById: {},
+      themes: {
+        baseTheme: theme,
+      },
+    };
+
+    data.schemaVersion = CACHE_SCHEMA_VERSION;
+    data.updatedAt = new Date().toISOString();
+    data.sourceSite = DOCS_ROOT_URL;
+    data.themes = {
+      baseTheme: theme,
+    };
+
+    await this.cacheService.writeCache(data);
+  }
+
   private async expandStorybookCodeSections(frame: Frame): Promise<void> {
     try {
       const showCodeButtons = frame.getByRole("button", { name: /show code/i });
@@ -828,6 +1078,397 @@ export class ScraperService implements OnApplicationShutdown {
     } catch (error) {
       console.error("Failed to fetch component IDs from index.json:", error);
       return [];
+    }
+  }
+
+  private async scrapeBaseThemeGuidelines(
+    browser: Awaited<ReturnType<typeof chromium.launch>>,
+  ): Promise<{ guidelines: BaseThemeGuidelines; warnings: string[] }> {
+    const warnings: string[] = [];
+    const stories = await this.getBaseThemeStoriesFromIndex();
+    if (stories.length === 0) {
+      throw new Error("No base theme stories found in Storybook index.");
+    }
+
+    const extractedStories: BaseThemeGuidelines["stories"] = [];
+    for (const story of stories) {
+      const extracted = await this.scrapeBaseThemeStory(browser, story);
+      extractedStories.push(extracted.story);
+      if (extracted.warning) {
+        warnings.push(extracted.warning);
+      }
+    }
+
+    const mergedCssVars = this.mergeCssVariables(extractedStories);
+    const colorTokens = this.filterTokenGroup(
+      mergedCssVars,
+      ["color", "palette", "primary", "secondary", "accent", "neutral", "bg", "background"],
+      (value) => Boolean(this.normalizeColor(value)),
+    );
+    const typographyTokens = this.filterTokenGroup(
+      mergedCssVars,
+      ["font", "typography", "heading", "body", "line-height", "weight", "letter"],
+    );
+    const spacingTokens = this.filterTokenGroup(
+      mergedCssVars,
+      ["space", "spacing", "gap", "margin", "padding"],
+    );
+    const breakpoints = this.filterTokenGroup(
+      mergedCssVars,
+      ["breakpoint", "container", "screen", "viewport"],
+    );
+    const utilityClasses = this.extractUtilityClasses(extractedStories);
+    const backgroundPatterns = this.extractBackgroundPatterns(extractedStories);
+    const colorValues = Array.from(
+      new Set(
+        [
+          ...Object.values(colorTokens),
+          ...extractedStories.flatMap((story) => story.colors),
+        ]
+          .map((value) => this.normalizeColor(value))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    ).sort();
+    const typographyFamilies = Array.from(
+      new Set(
+        [
+          ...Object.values(typographyTokens),
+          ...extractedStories.flatMap((story) => story.typographyFamilies),
+        ]
+          .map((value) => this.normalizeFontFamily(value))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    ).sort();
+
+    const guidelines: BaseThemeGuidelines = {
+      updatedAt: new Date().toISOString(),
+      sourceSite: DOCS_ROOT_URL,
+      sourceIndexUrl: INDEX_JSON_URL,
+      storyCount: extractedStories.length,
+      storyIds: extractedStories.map((story) => story.storyId),
+      stories: extractedStories,
+      colorTokens,
+      typographyTokens,
+      spacingTokens,
+      breakpoints,
+      utilityClasses,
+      backgroundPatterns,
+      colorValues,
+      typographyFamilies,
+      notes: [
+        "Guidelines are scraped from Storybook Foundations/Base Theme stories.",
+        "Validation currently enforces palette and typography families from base theme tokens.",
+      ],
+    };
+
+    return { guidelines, warnings };
+  }
+
+  private async getBaseThemeStoriesFromIndex(): Promise<
+    Array<{ id: string; title: string; name: string; storyUrl: string; iframeUrl: string }>
+  > {
+    const response = await fetch(INDEX_JSON_URL);
+    if (!response.ok) {
+      throw new Error(`Failed to load Storybook index.json: ${response.status}`);
+    }
+
+    const parsed = (await response.json()) as {
+      entries?: Record<
+        string,
+        {
+          id?: string;
+          title?: string;
+          name?: string;
+          type?: string;
+        }
+      >;
+    };
+
+    const entries = Object.values(parsed.entries ?? {});
+    return entries
+      .filter((entry) => {
+        const id = entry.id?.trim() ?? "";
+        const title = entry.title?.trim() ?? "";
+        return (
+          entry.type === "story" &&
+          title === BASE_THEME_TITLE &&
+          id.startsWith(BASE_THEME_STORY_PREFIX)
+        );
+      })
+      .map((entry) => {
+        const id = entry.id?.trim() ?? "";
+        const title = entry.title?.trim() ?? BASE_THEME_TITLE;
+        const name = entry.name?.trim() ?? id;
+        return {
+          id,
+          title,
+          name,
+          storyUrl: `${DOCS_ROOT_URL}?path=/story/${id}`,
+          iframeUrl: `${DOCS_ROOT_URL}iframe.html?id=${id}&viewMode=story`,
+        };
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  private async scrapeBaseThemeStory(
+    browser: Awaited<ReturnType<typeof chromium.launch>>,
+    story: { id: string; title: string; name: string; storyUrl: string; iframeUrl: string },
+  ): Promise<{ story: BaseThemeGuidelines["stories"][number]; warning?: string }> {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    try {
+      await page.goto(story.iframeUrl, {
+        waitUntil: "networkidle",
+        timeout: PAGE_TIMEOUT_MS,
+      });
+
+      const extracted = await page.evaluate(() => {
+        const doc = (globalThis as any).document;
+        const win = (globalThis as any).window;
+        const root = doc.documentElement;
+        const computed = win.getComputedStyle(root);
+        const cssVariables: Record<string, string> = {};
+        for (const propertyName of computed) {
+          if (!propertyName.startsWith("--")) {
+            continue;
+          }
+          const value = computed.getPropertyValue(propertyName).trim();
+          if (!value) {
+            continue;
+          }
+          cssVariables[propertyName] = value;
+        }
+
+        const text = (doc.body?.innerText ?? "")
+          .split("\n")
+          .map((line: string) => line.trim())
+          .filter(Boolean);
+
+        const html = doc.body?.innerHTML ?? "";
+        const colors = Array.from(
+          new Set([
+            ...(Array.from(
+              html.matchAll(
+                /#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|hsla?\([^)]*\)/g,
+              ),
+            ) as RegExpMatchArray[]).map((match) => match[0].trim()),
+          ]),
+        );
+
+        const typographyFamilies = Array.from(
+          new Set(
+            Object.values(cssVariables)
+              .filter((value) => value.includes(",") || /[A-Za-z]/.test(value))
+              .filter((value) => value.toLowerCase().includes("serif") || value.includes("'") || value.includes('"')),
+          ),
+        );
+
+        return {
+          cssVariables,
+          extractedText: text.slice(0, 800),
+          colors,
+          typographyFamilies,
+        };
+      });
+
+      return {
+        story: {
+          storyId: story.id,
+          title: story.title,
+          name: story.name,
+          url: story.storyUrl,
+          iframeUrl: story.iframeUrl,
+          extractedText: extracted.extractedText,
+          cssVariables: extracted.cssVariables,
+          colors: extracted.colors,
+          typographyFamilies: extracted.typographyFamilies,
+        },
+      };
+    } catch (error) {
+      console.error(`Failed to scrape base theme story ${story.id}:`, error);
+      return {
+        story: {
+          storyId: story.id,
+          title: story.title,
+          name: story.name,
+          url: story.storyUrl,
+          iframeUrl: story.iframeUrl,
+          extractedText: [],
+          cssVariables: {},
+          colors: [],
+          typographyFamilies: [],
+          warnings: ["Unable to load story content."],
+        },
+        warning: `Failed to scrape base theme story ${story.id}.`,
+      };
+    } finally {
+      await page.close();
+      await context.close();
+    }
+  }
+
+  private mergeCssVariables(
+    stories: BaseThemeGuidelines["stories"],
+  ): Record<string, string> {
+    const merged: Record<string, string> = {};
+    for (const story of stories) {
+      for (const [key, value] of Object.entries(story.cssVariables)) {
+        if (!merged[key]) {
+          merged[key] = value;
+        }
+      }
+    }
+    return merged;
+  }
+
+  private filterTokenGroup(
+    tokens: Record<string, string>,
+    keywords: string[],
+    extraPredicate?: (value: string, key: string) => boolean,
+  ): Record<string, string> {
+    const selected: Record<string, string> = {};
+    for (const [key, value] of Object.entries(tokens)) {
+      const lowerKey = key.toLowerCase();
+      if (!keywords.some((word) => lowerKey.includes(word))) {
+        continue;
+      }
+      if (extraPredicate && !extraPredicate(value, key)) {
+        continue;
+      }
+      selected[key] = value;
+    }
+    return selected;
+  }
+
+  private extractUtilityClasses(stories: BaseThemeGuidelines["stories"]): string[] {
+    const classes = new Set<string>();
+    for (const story of stories) {
+      if (!story.storyId.endsWith("--utility-classes")) {
+        continue;
+      }
+      for (const line of story.extractedText) {
+        const matches = line.match(/\.[A-Za-z0-9_-]+/g) ?? [];
+        for (const match of matches) {
+          classes.add(match);
+        }
+      }
+    }
+    return Array.from(classes).sort();
+  }
+
+  private extractBackgroundPatterns(
+    stories: BaseThemeGuidelines["stories"],
+  ): string[] {
+    const patterns = new Set<string>();
+    for (const story of stories) {
+      if (!story.storyId.endsWith("--background-patterns")) {
+        continue;
+      }
+      for (const line of story.extractedText) {
+        if (line.length < 3) {
+          continue;
+        }
+        patterns.add(line);
+      }
+    }
+    return Array.from(patterns).slice(0, 200);
+  }
+
+  private normalizeColor(value: string): string | null {
+    const raw = value.trim().toLowerCase();
+    if (!raw) {
+      return null;
+    }
+
+    if (/^#[0-9a-f]{3,8}$/.test(raw)) {
+      return this.hexToRgbString(raw);
+    }
+
+    const rgbMatch = raw.match(
+      /^rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)(?:\s*,\s*([0-9.]+))?\s*\)$/,
+    );
+    if (rgbMatch) {
+      const r = Number(rgbMatch[1]);
+      const g = Number(rgbMatch[2]);
+      const b = Number(rgbMatch[3]);
+      const a = rgbMatch[4] !== undefined ? Number(rgbMatch[4]) : undefined;
+      if ([r, g, b].some((n) => Number.isNaN(n))) {
+        return null;
+      }
+      if (a === undefined || Number.isNaN(a) || a >= 1) {
+        return `rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`;
+      }
+      return `rgba(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)}, ${Number(a.toFixed(3))})`;
+    }
+
+    return null;
+  }
+
+  private hexToRgbString(hex: string): string | null {
+    const value = hex.replace("#", "").trim();
+    if (![3, 4, 6, 8].includes(value.length)) {
+      return null;
+    }
+
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    let a: number | null = null;
+    if (value.length === 3 || value.length === 4) {
+      r = parseInt(value[0] + value[0], 16);
+      g = parseInt(value[1] + value[1], 16);
+      b = parseInt(value[2] + value[2], 16);
+      if (value.length === 4) {
+        a = parseInt(value[3] + value[3], 16) / 255;
+      }
+    } else {
+      r = parseInt(value.slice(0, 2), 16);
+      g = parseInt(value.slice(2, 4), 16);
+      b = parseInt(value.slice(4, 6), 16);
+      if (value.length === 8) {
+        a = parseInt(value.slice(6, 8), 16) / 255;
+      }
+    }
+
+    if ([r, g, b].some((n) => Number.isNaN(n))) {
+      return null;
+    }
+    if (a === null || a >= 1) {
+      return `rgb(${r}, ${g}, ${b})`;
+    }
+    return `rgba(${r}, ${g}, ${b}, ${Number(a.toFixed(3))})`;
+  }
+
+  private isIgnorableColor(color: string): boolean {
+    return (
+      color === "rgba(0, 0, 0, 0)" ||
+      color === "transparent" ||
+      color === "inherit"
+    );
+  }
+
+  private normalizeFontFamily(value: string): string | null {
+    const cleaned = value
+      .split(",")
+      .map((item) => item.replace(/["']/g, "").trim().toLowerCase())
+      .find(Boolean);
+    return cleaned ?? null;
+  }
+
+  private normalizeExternalUrl(value: string): string {
+    const raw = value.trim();
+    if (!raw) {
+      return "";
+    }
+
+    try {
+      const candidate = new URL(raw);
+      if (!["http:", "https:"].includes(candidate.protocol)) {
+        return "";
+      }
+      return candidate.toString();
+    } catch {
+      return "";
     }
   }
 

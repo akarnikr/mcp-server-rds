@@ -5,7 +5,10 @@ import { CacheService } from "../common/cache.service.js";
 import { ParserService } from "./parser.service.js";
 import type {
   CachedRdsData,
+  ParsedComponentData,
+  RdsComponentMetadata,
   RdsComponentRecord,
+  RdsStoryRecord,
   ScrapeRunResult,
   ScrapedPagePayload,
 } from "./types.js";
@@ -56,7 +59,11 @@ export class ScraperService implements OnApplicationShutdown {
     parsed: CachedRdsData["detailsById"][string] | null;
     fromCache: boolean;
   }> {
-    const normalizedId = this.normalizeComponentId(componentId);
+    const inputId = this.normalizeComponentId(componentId);
+    if (!inputId) {
+      return { parsed: null, fromCache: false };
+    }
+    const normalizedId = await this.resolveCanonicalComponentId(inputId);
     if (!normalizedId) {
       return { parsed: null, fromCache: false };
     }
@@ -100,6 +107,84 @@ export class ScraperService implements OnApplicationShutdown {
       }
       return { parsed: null, fromCache: false };
     }
+  }
+
+  async getComponentMetadata(
+    componentRef: string,
+  ): Promise<RdsComponentMetadata | { error: string }> {
+    const normalizedInput = this.normalizeComponentRef(componentRef);
+    if (!normalizedInput) {
+      return { error: `Component not found: ${componentRef}` };
+    }
+
+    const detailsResult = await this.getComponentDetails(normalizedInput);
+    const parsed = detailsResult.parsed;
+    if (!parsed) {
+      return { error: `Component not found: ${componentRef}` };
+    }
+    const componentId = parsed.componentId;
+
+    const stories = await this.findStoriesForComponent(componentId);
+    const packageInfo = await this.resolvePackageInfo(componentId);
+    const category = this.extractCategoryFromStories(stories);
+
+    const warnings = [...(parsed.warnings ?? [])];
+    if (stories.length === 0) {
+      warnings.push("No matching stories were found in Storybook index.");
+    }
+    if (!packageInfo.packageName) {
+      warnings.push("Unable to resolve npm package metadata for component.");
+    }
+
+    if (parsed.propsRows.length === 0) {
+      warnings.push("No props rows parsed for this component.");
+    }
+    warnings.push(
+      "Events and slots are not explicitly documented in source tables; returned as empty arrays.",
+    );
+
+    const description =
+      packageInfo.description ??
+      this.firstNonEmptyPropField(parsed, ["Description", "description"]) ??
+      null;
+
+    const metadata = {
+      name: this.toPascalCase(componentId),
+      package: packageInfo.packageName,
+      version: packageInfo.version,
+      description,
+      category,
+      props: parsed.propsRows,
+      events: [],
+      slots: [],
+      stories,
+      peerDependencies: packageInfo.peerDependencies,
+      lastPublished: packageInfo.lastPublished,
+      importStatement: packageInfo.packageName
+        ? `import { ${this.toPascalCase(componentId)} } from "${packageInfo.packageName}";`
+        : null,
+      installCommand: packageInfo.packageName
+        ? `yarn add ${packageInfo.packageName}`
+        : null,
+      sourceMeta: {
+        docsUrl: parsed.url,
+        indexJsonUrl: INDEX_JSON_URL,
+        npmRegistryUrl: packageInfo.registryUrl,
+        fetchedAt: new Date().toISOString(),
+        fromCache: detailsResult.fromCache,
+      },
+      metadataCompleteness: this.computeCompleteness({
+        props: parsed.propsRows,
+        stories,
+        packageName: packageInfo.packageName,
+        version: packageInfo.version,
+        description,
+        lastPublished: packageInfo.lastPublished,
+      }),
+      warnings,
+    } satisfies RdsComponentMetadata;
+
+    return metadata;
   }
 
   private async runLiveRefresh(startedAt: number): Promise<ScrapeRunResult> {
@@ -355,6 +440,52 @@ export class ScraperService implements OnApplicationShutdown {
     return null;
   }
 
+  private async findStoriesForComponent(
+    componentId: string,
+  ): Promise<RdsStoryRecord[]> {
+    try {
+      const response = await fetch(INDEX_JSON_URL);
+      if (!response.ok) {
+        return [];
+      }
+
+      const parsed = (await response.json()) as {
+        entries?: Record<string, { id?: string; title?: string; type?: string }>;
+      };
+      const entries = Object.values(parsed.entries ?? {});
+
+      const stories: RdsStoryRecord[] = [];
+      for (const entry of entries) {
+        const storyId = entry.id?.trim() ?? "";
+        const storyTitle = entry.title?.trim() ?? "";
+        const storyType = entry.type?.trim() ?? "unknown";
+        if (!storyId.startsWith("components-") || !storyTitle) {
+          continue;
+        }
+
+        const leaf = storyTitle.split("/").at(-1) ?? "";
+        if (this.slugifyValue(leaf) !== componentId) {
+          continue;
+        }
+
+        const isDocs = storyId.endsWith("--docs");
+        stories.push({
+          id: storyId,
+          title: storyTitle,
+          type: storyType,
+          url: isDocs
+            ? `${DOCS_ROOT_URL}?path=/docs/${storyId}`
+            : `${DOCS_ROOT_URL}?path=/story/${storyId}`,
+        });
+      }
+
+      return stories;
+    } catch (error) {
+      console.error("Failed to fetch stories for component:", error);
+      return [];
+    }
+  }
+
   private async scrapeComponentPages(
     browser: Awaited<ReturnType<typeof chromium.launch>>,
     components: RdsComponentRecord[],
@@ -447,6 +578,47 @@ export class ScraperService implements OnApplicationShutdown {
     return value.trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
   }
 
+  private normalizeComponentRef(value: string): string {
+    const raw = value.trim();
+    if (!raw) {
+      return "";
+    }
+
+    if (raw.startsWith("@rds-vue-ui/")) {
+      return this.normalizeComponentId(raw.replace("@rds-vue-ui/", ""));
+    }
+
+    if (/^Rds[A-Z]/.test(raw)) {
+      return this.slugifyValue(raw.replace(/^Rds/, ""));
+    }
+
+    return this.normalizeComponentId(raw);
+  }
+
+  private async resolveCanonicalComponentId(
+    requestedId: string,
+  ): Promise<string | null> {
+    const staleCache = await this.cacheService.readCache();
+    const fromCache = (staleCache?.components ?? []).map((item) => item.componentId);
+    const fromIndex = await this.getComponentIdsFromIndex();
+    const candidateIds = Array.from(new Set([...fromCache, ...fromIndex]));
+
+    if (candidateIds.length === 0) {
+      return requestedId;
+    }
+
+    if (candidateIds.includes(requestedId)) {
+      return requestedId;
+    }
+
+    const ranked = candidateIds
+      .map((id) => ({ id, score: this.matchScore(requestedId, id) }))
+      .filter((entry) => entry.score < Number.POSITIVE_INFINITY)
+      .sort((a, b) => a.score - b.score || a.id.length - b.id.length || a.id.localeCompare(b.id));
+
+    return ranked[0]?.id ?? null;
+  }
+
   private titleFromSlug(slug: string): string {
     return slug
       .split("-")
@@ -513,5 +685,169 @@ export class ScraperService implements OnApplicationShutdown {
     } catch (error) {
       console.error("Failed to expand Storybook code sections:", error);
     }
+  }
+
+  private async resolvePackageInfo(componentId: string): Promise<{
+    packageName: string | null;
+    version: string | null;
+    description: string | null;
+    peerDependencies: Record<string, string>;
+    lastPublished: string | null;
+    registryUrl: string | null;
+  }> {
+    const candidateSuffixes = Array.from(
+      new Set([componentId, componentId.split("-")[0]]),
+    ).filter(Boolean);
+
+    for (const suffix of candidateSuffixes) {
+      const packageName = `@rds-vue-ui/${suffix}`;
+      const encoded = packageName.replace("/", "%2F");
+      const registryUrl = `https://registry.npmjs.org/${encoded}`;
+      try {
+        const response = await fetch(registryUrl);
+        if (!response.ok) {
+          continue;
+        }
+
+        const body = (await response.json()) as {
+          description?: string;
+          time?: Record<string, string>;
+          "dist-tags"?: Record<string, string>;
+          versions?: Record<string, { peerDependencies?: Record<string, string> }>;
+        };
+
+        const version = body["dist-tags"]?.latest ?? null;
+        const peerDependencies = version
+          ? (body.versions?.[version]?.peerDependencies ?? {})
+          : {};
+        const lastPublished =
+          (version ? body.time?.[version] : null) ?? body.time?.latest ?? null;
+
+        return {
+          packageName,
+          version,
+          description: body.description ?? null,
+          peerDependencies,
+          lastPublished,
+          registryUrl,
+        };
+      } catch (error) {
+        console.error(`Failed npm metadata fetch for ${packageName}:`, error);
+      }
+    }
+
+    return {
+      packageName: null,
+      version: null,
+      description: null,
+      peerDependencies: {},
+      lastPublished: null,
+      registryUrl: null,
+    };
+  }
+
+  private firstNonEmptyPropField(
+    parsed: ParsedComponentData,
+    keys: string[],
+  ): string | null {
+    for (const row of parsed.propsRows) {
+      for (const key of keys) {
+        const value = row[key];
+        if (value && value.trim()) {
+          return value.trim();
+        }
+      }
+    }
+    return null;
+  }
+
+  private extractCategoryFromStories(stories: RdsStoryRecord[]): string | null {
+    const first = stories[0]?.title;
+    if (!first) {
+      return null;
+    }
+    const parts = first.split("/").map((part) => part.trim()).filter(Boolean);
+    if (parts.length < 2) {
+      return null;
+    }
+    return parts.slice(0, parts.length - 1).join("/");
+  }
+
+  private toPascalCase(slug: string): string {
+    return slug
+      .split("-")
+      .filter(Boolean)
+      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+      .join("");
+  }
+
+  private computeCompleteness(input: {
+    props: Array<Record<string, string>>;
+    stories: RdsStoryRecord[];
+    packageName: string | null;
+    version: string | null;
+    description: string | null;
+    lastPublished: string | null;
+  }): { score: number; missing: string[] } {
+    const required = [
+      { key: "props", ok: input.props.length > 0 },
+      { key: "stories", ok: input.stories.length > 0 },
+      { key: "package", ok: Boolean(input.packageName) },
+      { key: "version", ok: Boolean(input.version) },
+      { key: "description", ok: Boolean(input.description) },
+      { key: "lastPublished", ok: Boolean(input.lastPublished) },
+    ];
+
+    const present = required.filter((item) => item.ok).length;
+    const score = Number((present / required.length).toFixed(2));
+    const missing = required.filter((item) => !item.ok).map((item) => item.key);
+    return { score, missing };
+  }
+
+  private async getComponentIdsFromIndex(): Promise<string[]> {
+    try {
+      const response = await fetch(INDEX_JSON_URL);
+      if (!response.ok) {
+        return [];
+      }
+      const parsed = (await response.json()) as {
+        entries?: Record<string, { id?: string; title?: string }>;
+      };
+      const entries = Object.values(parsed.entries ?? {});
+      const ids = entries
+        .map((entry) => entry.title?.trim() ?? "")
+        .filter((title) => title.toLowerCase().startsWith("components/"))
+        .map((title) => this.slugifyValue(title.split("/").at(-1) ?? ""))
+        .filter(Boolean);
+      return Array.from(new Set(ids));
+    } catch (error) {
+      console.error("Failed to fetch component IDs from index.json:", error);
+      return [];
+    }
+  }
+
+  private matchScore(requestedId: string, candidateId: string): number {
+    if (candidateId === requestedId) {
+      return 0;
+    }
+    if (candidateId.startsWith(`${requestedId}-`) || candidateId.startsWith(requestedId)) {
+      return 1 + Math.abs(candidateId.length - requestedId.length) * 0.01;
+    }
+    if (candidateId.includes(requestedId)) {
+      return 2 + Math.abs(candidateId.length - requestedId.length) * 0.01;
+    }
+    if (
+      requestedId.endsWith("s") &&
+      candidateId.startsWith(requestedId.slice(0, -1))
+    ) {
+      return 3;
+    }
+    if (
+      candidateId.endsWith("s") &&
+      candidateId.slice(0, -1) === requestedId
+    ) {
+      return 3;
+    }
+    return Number.POSITIVE_INFINITY;
   }
 }

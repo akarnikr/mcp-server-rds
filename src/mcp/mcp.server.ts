@@ -108,6 +108,19 @@ export class McpServerService implements OnApplicationShutdown {
               additionalProperties: false,
             },
           },
+          {
+            name: "get_component_details",
+            description:
+              "Returns full metadata for one RDS component from docs/cache/npm.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                component: { type: "string" },
+              },
+              required: ["component"],
+              additionalProperties: false,
+            },
+          },
         ],
       };
     });
@@ -175,6 +188,15 @@ export class McpServerService implements OnApplicationShutdown {
               refreshedAt: run.data.updatedAt,
               durationMs: run.durationMs,
             };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
+          if (name === "get_component_details") {
+            const component =
+              typeof args?.component === "string" ? args.component : "";
+            const result = await this.scraperService.getComponentMetadata(component);
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
             };

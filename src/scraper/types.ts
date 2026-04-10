@@ -8,6 +8,7 @@ export type ParsedComponentData = {
   componentId: string;
   url: string;
   sourceCode: string | null;
+  installCommand: string | null;
   propsColumns: string[];
   propsRows: Array<Record<string, string>>;
   warnings?: string[];

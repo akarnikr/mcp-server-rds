@@ -19,10 +19,16 @@ export class ParserService {
       warnings.push(propsWarning);
     }
 
+    const { installCommand, installWarning } = this.extractInstallCommand($);
+    if (installWarning) {
+      warnings.push(installWarning);
+    }
+
     return {
       componentId: payload.componentId,
       url: payload.url,
       sourceCode,
+      installCommand,
       propsColumns,
       propsRows,
       warnings: warnings.length > 0 ? warnings : undefined,
@@ -169,6 +175,85 @@ export class ParserService {
           ? "Props table detected, but no data rows were parsed."
           : undefined,
     };
+  }
+
+  private extractInstallCommand($: ReturnType<typeof load>): {
+    installCommand: string | null;
+    installWarning?: string;
+  } {
+    const fromInstallSection = this.extractInstallCommandFromInstallSection($);
+    if (fromInstallSection) {
+      return { installCommand: fromInstallSection };
+    }
+
+    const fallbackCandidates = $("pre, pre code, code")
+      .toArray()
+      .map((node) => this.cleanText($(node).text()))
+      .filter(Boolean)
+      .filter((text) => this.looksLikeInstallCommand(text));
+
+    if (fallbackCandidates.length > 0) {
+      return {
+        installCommand: fallbackCandidates[0],
+        installWarning:
+          "Install command inferred from code blocks outside explicit Install section.",
+      };
+    }
+
+    return {
+      installCommand: null,
+      installWarning: "No install command found in docs page.",
+    };
+  }
+
+  private extractInstallCommandFromInstallSection(
+    $: ReturnType<typeof load>,
+  ): string | null {
+    const headings = $("h1, h2, h3, h4, h5, h6").toArray();
+    const installHeading = headings.find((heading) => {
+      const text = this.cleanText($(heading).text()).toLowerCase();
+      return text === "install" || text.startsWith("install ");
+    });
+
+    if (!installHeading) {
+      return null;
+    }
+
+    const commandFromSiblings = $(installHeading)
+      .nextAll()
+      .toArray()
+      .flatMap((node) =>
+        $(node)
+          .find("pre, pre code, code")
+          .toArray()
+          .map((codeNode) => this.cleanText($(codeNode).text())),
+      )
+      .find((text) => this.looksLikeInstallCommand(text));
+
+    if (commandFromSiblings) {
+      return commandFromSiblings;
+    }
+
+    const commandFromClosestSection = $(installHeading)
+      .parent()
+      .find("pre, pre code, code")
+      .toArray()
+      .map((node) => this.cleanText($(node).text()))
+      .find((text) => this.looksLikeInstallCommand(text));
+
+    return commandFromClosestSection ?? null;
+  }
+
+  private looksLikeInstallCommand(text: string): boolean {
+    const candidate = text.toLowerCase();
+    return (
+      (candidate.startsWith("npm install") ||
+        candidate.startsWith("npm i ") ||
+        candidate.startsWith("yarn add ") ||
+        candidate.startsWith("pnpm add ") ||
+        candidate.startsWith("bun add ")) &&
+      (candidate.includes("@rds-vue-ui/") || candidate.includes("rds-vue-ui"))
+    );
   }
 
   private cleanText(value: string): string {

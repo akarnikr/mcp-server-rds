@@ -16,7 +16,9 @@ import type {
 const DOCS_ROOT_URL = "https://rds-vue-ui.edpl.us/";
 const INDEX_JSON_URL = new URL("index.json", DOCS_ROOT_URL).toString();
 const NAV_PATH_FRAGMENT = "/components/";
-const CACHE_SCHEMA_VERSION = 1;
+const CACHE_SCHEMA_VERSION = 2;
+const GENERIC_INSTALL_FALLBACK =
+  "yarn add --registry=https://npm.edpl.us @rds-vue-ui/<component-package>";
 const BATCH_SIZE = 3;
 const INTER_BATCH_DELAY_MS = 1000;
 const PAGE_TIMEOUT_MS = 20_000;
@@ -69,8 +71,9 @@ export class ScraperService implements OnApplicationShutdown {
     }
 
     const freshCache = await this.cacheService.getFreshCache();
-    if (freshCache?.detailsById[normalizedId]) {
-      return { parsed: freshCache.detailsById[normalizedId], fromCache: true };
+    const freshParsed = freshCache?.detailsById[normalizedId];
+    if (freshParsed && freshParsed.installCommand) {
+      return { parsed: freshParsed, fromCache: true };
     }
 
     const staleCache = await this.cacheService.readCache();
@@ -163,9 +166,11 @@ export class ScraperService implements OnApplicationShutdown {
       importStatement: packageInfo.packageName
         ? `import { ${this.toPascalCase(componentId)} } from "${packageInfo.packageName}";`
         : null,
-      installCommand: packageInfo.packageName
-        ? `yarn add ${packageInfo.packageName}`
-        : null,
+      installCommand:
+        parsed.installCommand ??
+        (packageInfo.packageName
+          ? `yarn add --registry=https://npm.edpl.us ${packageInfo.packageName}`
+          : GENERIC_INSTALL_FALLBACK),
       sourceMeta: {
         docsUrl: parsed.url,
         indexJsonUrl: INDEX_JSON_URL,

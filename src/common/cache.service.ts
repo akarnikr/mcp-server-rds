@@ -6,6 +6,7 @@ import type { CachedRdsData } from "../scraper/types.js";
 
 const CACHE_DIR = path.resolve(process.cwd(), ".cache");
 const CACHE_FILE = path.join(CACHE_DIR, "rds-data.json");
+const CURRENT_CACHE_SCHEMA_VERSION = 1;
 
 @Injectable()
 export class CacheService {
@@ -49,6 +50,9 @@ export class CacheService {
   async getFreshCache(ttlHours = 24): Promise<CachedRdsData | null> {
     const cache = await this.readCache();
     if (!cache) {
+      return null;
+    }
+    if (cache.schemaVersion !== CURRENT_CACHE_SCHEMA_VERSION) {
       return null;
     }
 

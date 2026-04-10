@@ -14,6 +14,7 @@ export type ParsedComponentData = {
 };
 
 export type CachedRdsData = {
+  schemaVersion: number;
   updatedAt: string;
   sourceSite: string;
   components: RdsComponentRecord[];

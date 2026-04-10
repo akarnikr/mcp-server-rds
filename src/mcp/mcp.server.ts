@@ -9,16 +9,19 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Request, Response } from "express";
 
-import { generateRdsComponentTool } from "./tools/generate-rds-component.tool.js";
-import { listRdsComponentsTool } from "./tools/list-rds-components.tool.js";
-import { refreshRdsCacheTool } from "./tools/refresh-rds-cache.tool.js";
+import { CacheService } from "../common/cache.service.js";
+import { ScraperService } from "../scraper/scraper.service.js";
+import type { ParsedComponentData } from "../scraper/types.js";
 
 @Injectable()
 export class McpServerService {
   private readonly server: Server;
   private sseTransport: SSEServerTransport | null = null;
 
-  constructor() {
+  constructor(
+    private readonly scraperService: ScraperService,
+    private readonly cacheService: CacheService,
+  ) {
     this.server = new Server(
       {
         name: "mcp-server-rds",
@@ -61,7 +64,7 @@ export class McpServerService {
         tools: [
           {
             name: "list_rds_components",
-            description: "List available RDS components (Phase 1 stub).",
+            description: "Returns the list of available RDS components.",
             inputSchema: {
               type: "object",
               properties: {},
@@ -70,7 +73,8 @@ export class McpServerService {
           },
           {
             name: "generate_rds_component",
-            description: "Generate RDS component usage (Phase 1 stub).",
+            description:
+              "Returns source code and props data for a requested RDS component.",
             inputSchema: {
               type: "object",
               properties: {
@@ -82,7 +86,7 @@ export class McpServerService {
           },
           {
             name: "refresh_rds_cache",
-            description: "Refresh RDS cache (Phase 1 stub).",
+            description: "Forces a full live scrape and refreshes local cache.",
             inputSchema: {
               type: "object",
               properties: {},
@@ -96,36 +100,151 @@ export class McpServerService {
     this.server.setRequestHandler(
       CallToolRequestSchema,
       async (request: CallToolRequest) => {
-        const { name, arguments: args } = request.params;
+        try {
+          const { name, arguments: args } = request.params;
 
-        if (name === "list_rds_components") {
-          const result = listRdsComponentsTool();
+          if (name === "list_rds_components") {
+            const run = await this.scraperService.getRdsData();
+            const result = {
+              components: run.data.components,
+              fromCache: run.fromCache,
+              updatedAt: run.data.updatedAt,
+              warnings: run.warnings,
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
+          if (name === "generate_rds_component") {
+            const componentId =
+              typeof args?.componentId === "string" ? args.componentId : "";
+            const normalizedId = this.normalizeComponentId(componentId);
+            if (!normalizedId) {
+              return {
+                isError: true,
+                content: [
+                  {
+                    type: "text",
+                    text: "Invalid componentId. Expected a non-empty slug string.",
+                  },
+                ],
+              };
+            }
+
+            const parsed = await this.findComponentDetails(normalizedId);
+            if (!parsed) {
+              return {
+                isError: true,
+                content: [
+                  {
+                    type: "text",
+                    text: `Unknown componentId: ${normalizedId}`,
+                  },
+                ],
+              };
+            }
+
+            const result = this.formatComponentBlob(parsed);
+            return {
+              content: [{ type: "text", text: result }],
+            };
+          }
+
+          if (name === "refresh_rds_cache") {
+            const run = await this.scraperService.getRdsData({ forceRefresh: true });
+            const result = {
+              componentsDiscovered: run.data.components.length,
+              componentsParsed: Object.keys(run.data.detailsById).length,
+              cachePath: this.cacheService.cachePath,
+              refreshedAt: run.data.updatedAt,
+              durationMs: run.durationMs,
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
           return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            isError: true,
+            content: [{ type: "text", text: `Unknown tool: ${name}` }],
+          };
+        } catch (error) {
+          console.error("Tool execution failed:", error);
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "Tool execution failed. See server logs for details.",
+              },
+            ],
           };
         }
-
-        if (name === "generate_rds_component") {
-          const componentId =
-            typeof args?.componentId === "string" ? args.componentId : "";
-          const result = generateRdsComponentTool({ componentId });
-          return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          };
-        }
-
-        if (name === "refresh_rds_cache") {
-          const result = refreshRdsCacheTool();
-          return {
-            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          };
-        }
-
-        return {
-          isError: true,
-          content: [{ type: "text", text: `Unknown tool: ${name}` }],
-        };
       },
     );
+  }
+
+  private async findComponentDetails(
+    componentId: string,
+  ): Promise<ParsedComponentData | null> {
+    const result = await this.scraperService.getComponentDetails(componentId);
+    return result.parsed;
+  }
+
+  private normalizeComponentId(input: string): string {
+    return input.trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
+  }
+
+  private formatComponentBlob(component: ParsedComponentData): string {
+    const lines: string[] = [];
+    lines.push(`# ${component.componentId}`);
+    lines.push(`URL: ${component.url}`);
+    lines.push("");
+    lines.push("## Source Code");
+    if (component.sourceCode) {
+      lines.push("```vue");
+      lines.push(component.sourceCode);
+      lines.push("```");
+    } else {
+      lines.push("No source code found.");
+    }
+    lines.push("");
+    lines.push("## Props");
+    if (component.propsColumns.length > 0 && component.propsRows.length > 0) {
+      lines.push(this.toMarkdownTable(component.propsColumns, component.propsRows));
+    } else {
+      lines.push("No props data found.");
+    }
+
+    if (component.warnings && component.warnings.length > 0) {
+      lines.push("");
+      lines.push("## Warnings");
+      for (const warning of component.warnings) {
+        lines.push(`- ${warning}`);
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  private toMarkdownTable(
+    columns: string[],
+    rows: Array<Record<string, string>>,
+  ): string {
+    const safeColumns = columns.map((column) => this.escapePipe(column));
+    const header = `| ${safeColumns.join(" | ")} |`;
+    const separator = `| ${safeColumns.map(() => "---").join(" | ")} |`;
+
+    const body = rows.map((row) => {
+      const cells = columns.map((column) => this.escapePipe(row[column] ?? ""));
+      return `| ${cells.join(" | ")} |`;
+    });
+
+    return [header, separator, ...body].join("\n");
+  }
+
+  private escapePipe(value: string): string {
+    return value.replace(/\|/g, "\\|");
   }
 }

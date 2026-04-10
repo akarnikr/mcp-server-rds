@@ -1,5 +1,5 @@
 import { Injectable } from "@nestjs/common";
-import { chromium } from "playwright";
+import { chromium, type Frame } from "playwright";
 
 import { CacheService } from "../common/cache.service.js";
 import { ParserService } from "./parser.service.js";
@@ -13,6 +13,7 @@ import type {
 const DOCS_ROOT_URL = "https://rds-vue-ui.edpl.us/";
 const INDEX_JSON_URL = new URL("index.json", DOCS_ROOT_URL).toString();
 const NAV_PATH_FRAGMENT = "/components/";
+const CACHE_SCHEMA_VERSION = 1;
 const BATCH_SIZE = 3;
 const INTER_BATCH_DELAY_MS = 1000;
 const PAGE_TIMEOUT_MS = 20_000;
@@ -44,6 +45,63 @@ export class ScraperService {
     return this.runLiveRefresh(startedAt);
   }
 
+  async getComponentDetails(componentId: string): Promise<{
+    parsed: CachedRdsData["detailsById"][string] | null;
+    fromCache: boolean;
+  }> {
+    const normalizedId = this.normalizeComponentId(componentId);
+    if (!normalizedId) {
+      return { parsed: null, fromCache: false };
+    }
+
+    const freshCache = await this.cacheService.getFreshCache();
+    if (freshCache?.detailsById[normalizedId]) {
+      return { parsed: freshCache.detailsById[normalizedId], fromCache: true };
+    }
+
+    const staleCache = await this.cacheService.readCache();
+    const cachedComponent = staleCache?.components.find(
+      (component) => component.componentId === normalizedId,
+    );
+    const resolvedComponent =
+      cachedComponent ?? (await this.resolveComponentFromIndex(normalizedId));
+
+    if (!resolvedComponent) {
+      return { parsed: null, fromCache: false };
+    }
+
+    try {
+      const browser = await chromium.launch({ headless: true });
+      try {
+        const scrapeResult = await this.scrapeSingleComponent(
+          browser,
+          resolvedComponent,
+        );
+        if (!scrapeResult.payload) {
+          if (staleCache?.detailsById[normalizedId]) {
+            return {
+              parsed: staleCache.detailsById[normalizedId],
+              fromCache: true,
+            };
+          }
+          return { parsed: null, fromCache: false };
+        }
+
+        const parsed = this.parserService.toParsedData(scrapeResult.payload);
+        await this.upsertSingleComponentCache(resolvedComponent, parsed);
+        return { parsed, fromCache: false };
+      } finally {
+        await browser.close();
+      }
+    } catch (error) {
+      console.error(`Failed single component scrape for ${normalizedId}:`, error);
+      if (staleCache?.detailsById[normalizedId]) {
+        return { parsed: staleCache.detailsById[normalizedId], fromCache: true };
+      }
+      return { parsed: null, fromCache: false };
+    }
+  }
+
   private async runLiveRefresh(startedAt: number): Promise<ScrapeRunResult> {
     const staleCache = await this.cacheService.readCache();
 
@@ -63,6 +121,7 @@ export class ScraperService {
         }
 
         const data: CachedRdsData = {
+          schemaVersion: CACHE_SCHEMA_VERSION,
           updatedAt: new Date().toISOString(),
           sourceSite: DOCS_ROOT_URL,
           components,
@@ -222,6 +281,49 @@ export class ScraperService {
     }
   }
 
+  private async resolveComponentFromIndex(
+    componentId: string,
+  ): Promise<RdsComponentRecord | null> {
+    try {
+      const response = await fetch(INDEX_JSON_URL);
+      if (!response.ok) {
+        return null;
+      }
+
+      const parsed = (await response.json()) as {
+        entries?: Record<string, { id?: string; title?: string }>;
+      };
+      const entries = Object.values(parsed.entries ?? {});
+
+      for (const entry of entries) {
+        const storyId = entry.id?.trim() ?? "";
+        const storyTitle = entry.title?.trim() ?? "";
+        if (!storyId.startsWith("components-") || !storyId.endsWith("--docs")) {
+          continue;
+        }
+        if (!storyTitle.toLowerCase().startsWith("components/")) {
+          continue;
+        }
+
+        const titleLeaf = storyTitle.split("/").at(-1) ?? storyId;
+        const slug = this.slugifyValue(titleLeaf);
+        if (slug !== componentId) {
+          continue;
+        }
+
+        return {
+          componentId: slug,
+          title: titleLeaf,
+          url: `${DOCS_ROOT_URL}?path=/docs/${storyId}`,
+        };
+      }
+    } catch (error) {
+      console.error("Failed to resolve component from index.json:", error);
+    }
+
+    return null;
+  }
+
   private async scrapeComponentPages(
     browser: Awaited<ReturnType<typeof chromium.launch>>,
     components: RdsComponentRecord[],
@@ -265,7 +367,17 @@ export class ScraperService {
         waitUntil: "networkidle",
         timeout: PAGE_TIMEOUT_MS,
       });
-      const html = await page.content();
+      const docsFrame = page
+        .frames()
+        .find(
+          (frame) =>
+            frame.url().includes("/iframe.html") &&
+            frame.url().includes("viewMode=docs"),
+        );
+      if (docsFrame) {
+        await this.expandStorybookCodeSections(docsFrame);
+      }
+      const html = docsFrame ? await docsFrame.content() : await page.content();
 
       return {
         payload: {
@@ -300,6 +412,10 @@ export class ScraperService {
     return lastSegment.replace(/[^a-z0-9-]/g, "");
   }
 
+  private normalizeComponentId(value: string): string {
+    return value.trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
+  }
+
   private titleFromSlug(slug: string): string {
     return slug
       .split("-")
@@ -320,5 +436,51 @@ export class ScraperService {
     await new Promise((resolve) => {
       setTimeout(resolve, ms);
     });
+  }
+
+  private async upsertSingleComponentCache(
+    component: RdsComponentRecord,
+    parsed: CachedRdsData["detailsById"][string],
+  ): Promise<void> {
+    const existing = await this.cacheService.readCache();
+    const data: CachedRdsData = existing ?? {
+      schemaVersion: CACHE_SCHEMA_VERSION,
+      updatedAt: new Date().toISOString(),
+      sourceSite: DOCS_ROOT_URL,
+      components: [],
+      detailsById: {},
+    };
+
+    data.schemaVersion = CACHE_SCHEMA_VERSION;
+    data.updatedAt = new Date().toISOString();
+    data.sourceSite = DOCS_ROOT_URL;
+
+    const existingIndex = data.components.findIndex(
+      (item) => item.componentId === component.componentId,
+    );
+    if (existingIndex >= 0) {
+      data.components[existingIndex] = component;
+    } else {
+      data.components.push(component);
+      data.components.sort((a, b) => a.componentId.localeCompare(b.componentId));
+    }
+
+    data.detailsById[component.componentId] = parsed;
+    await this.cacheService.writeCache(data);
+  }
+
+  private async expandStorybookCodeSections(frame: Frame): Promise<void> {
+    try {
+      const showCodeButtons = frame.getByRole("button", { name: /show code/i });
+      const count = await showCodeButtons.count();
+      for (let index = 0; index < count; index += 1) {
+        await showCodeButtons.nth(index).click().catch(() => undefined);
+      }
+      if (count > 0) {
+        await frame.waitForTimeout(300);
+      }
+    } catch (error) {
+      console.error("Failed to expand Storybook code sections:", error);
+    }
   }
 }

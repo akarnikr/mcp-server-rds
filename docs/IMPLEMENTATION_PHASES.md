@@ -23,6 +23,7 @@ This document breaks implementation into 4 executable phases. It is derived from
   - `list_rds_components`
   - `generate_rds_component`
   - `refresh_rds_cache`
+  - `get_component_details`
 - Cache path and TTL remain fixed:
   - `.cache/rds-data.json`
   - 24 hours

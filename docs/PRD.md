@@ -11,6 +11,7 @@ Provide an MCP server that exposes tools for:
 - listing available RDS components
 - generating component code and props details from docs
 - refreshing a local cache from live docs
+- returning enriched component metadata from docs/cache/npm
 
 ## Audience
 - AI assistants and agent workflows using MCP
@@ -44,6 +45,18 @@ Provide an MCP server that exposes tools for:
   - `cachePath`
   - `refreshedAt`
   - `durationMs`
+
+### 4) `get_component_details`
+- Input: `component` as slug-like identifier (example: `button`).
+- Resolves canonical component id, then assembles metadata from docs/cache/npm sources.
+- Returns JSON with:
+  - component identity (`name`, `package`, `version`, `description`, `category`)
+  - docs-derived API shape (`props`, plus currently empty `events` and `slots`)
+  - story discovery (`stories`)
+  - npm metadata (`peerDependencies`, `lastPublished`, `importStatement`, `installCommand`)
+  - source metadata (`sourceMeta`)
+  - completeness scoring (`metadataCompleteness`)
+  - warnings list (`warnings`)
 
 ## Scraping and Performance Requirements
 - Use Playwright Chromium.
@@ -83,11 +96,12 @@ Provide an MCP server that exposes tools for:
 - MCP client can list components from live docs using cache-aware behavior.
 - MCP client can request component generation by slug and get code+props blob.
 - Cache refresh runs in batched mode and reports summary JSON.
+- MCP client can request enriched component metadata by component id.
 - Server supports both stdio and SSE startup modes.
 - Scraper cleans up contexts/browser and does not leak resources across requests.
 
 ## Acceptance Checklist
-- [ ] All three MCP tools are implemented and callable.
+- [ ] All four MCP tools are implemented and callable.
 - [ ] Cache freshness and forced refresh logic works as specified.
 - [ ] Batch size, delay, timeout, and context lifecycle requirements are met.
 - [ ] SSE defaults and stdio fallback behavior are implemented.

@@ -30,6 +30,7 @@ Establish a working NestJS MCP server skeleton with dual transport support (`std
   - `list_rds_components`
   - `generate_rds_component`
   - `refresh_rds_cache`
+  - `get_component_details`
 
 ## Exit Criteria
 - App builds without TypeScript errors.

@@ -1,7 +1,7 @@
 # Phase 3: Parser and MCP Tools
 
 ## Objective
-Convert scraped docs into structured component data and complete functional behavior of all three MCP tools.
+Convert scraped docs into structured component data and complete functional behavior of all MCP tools.
 
 ## Implementation Tasks
 1. Implement parser service:
@@ -28,6 +28,11 @@ Convert scraped docs into structured component data and complete functional beha
   - bypass freshness checks
   - run full refresh flow
   - return summary JSON fields from approved contract
+- `get_component_details`:
+  - input `{ component: string }`
+  - resolve component id from slug-like input
+  - return enriched metadata assembled from docs/cache/npm
+  - return `{ error: string }` when unresolved
 
 3. Error semantics:
 - unknown slug -> clear tool error
@@ -36,12 +41,13 @@ Convert scraped docs into structured component data and complete functional beha
 
 ## Deliverables
 - Parser producing source and dynamic props data.
-- Three production-behavior MCP tools wired through `mcp.server.ts`.
+- Production-behavior MCP tools wired through `mcp.server.ts`, including `get_component_details`.
 
 ## Exit Criteria
 - Tool outputs match PRD/spec contracts.
 - `generate_rds_component` returns raw text blob for valid slug.
 - `list_rds_components` and `refresh_rds_cache` return expected metadata and summary fields.
+- `get_component_details` returns enriched metadata for valid components.
 
 ## Risks and Notes
 - Props table schema may vary by component; dynamic column parsing is required.

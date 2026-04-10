@@ -51,10 +51,11 @@ mcp-server-rds/
 
 ## 4.2 `McpModule`
 - Provides MCP server initializer (`mcp.server.ts`).
-- Registers 3 tools:
+- Registers 4 tools:
   - `list_rds_components`
   - `generate_rds_component`
   - `refresh_rds_cache`
+  - `get_component_details`
 
 ## 4.3 `ScraperModule`
 - Provides `ScraperService`, `ParserService`, `CacheService`.
@@ -84,6 +85,7 @@ type ParsedComponentData = {
   componentId: string;
   url: string;
   sourceCode: string | null;
+  installCommand: string | null;
   propsColumns: string[]; // all visible table headers
   propsRows: Array<Record<string, string>>; // dynamic per header
   warnings?: string[];
@@ -93,6 +95,7 @@ type ParsedComponentData = {
 ## 5.3 Cache document
 ```ts
 type CachedRdsData = {
+  schemaVersion: number;
   updatedAt: string; // ISO
   sourceSite: string; // https://rds-vue-ui.edpl.us/
   components: RdsComponentRecord[];
@@ -189,6 +192,47 @@ type CachedRdsData = {
 }
 ```
 
+## 8.4 `get_component_details`
+- Input schema:
+```ts
+{ component: string }
+```
+- Behavior:
+  - normalize/resolve component id
+  - fetch parsed docs details (cache-first with live scrape fallback)
+  - enrich with story index and npm registry metadata
+  - return JSON metadata object; return `{ error: string }` when unresolved
+- Output JSON shape:
+```ts
+type RdsComponentMetadata = {
+  name: string;
+  package: string | null;
+  version: string | null;
+  description: string | null;
+  category: string | null;
+  props: Array<Record<string, string>>;
+  events: Array<Record<string, string>>;
+  slots: Array<Record<string, string>>;
+  stories: Array<{ id: string; title: string; url: string; type: string }>;
+  peerDependencies: Record<string, string>;
+  lastPublished: string | null;
+  importStatement: string | null;
+  installCommand: string | null;
+  sourceMeta: {
+    docsUrl: string | null;
+    indexJsonUrl: string;
+    npmRegistryUrl: string | null;
+    fetchedAt: string;
+    fromCache: boolean;
+  };
+  metadataCompleteness: {
+    score: number;
+    missing: string[];
+  };
+  warnings: string[];
+};
+```
+
 ## 9. Logging and Error Policy
 - All logs must use `console.error`.
 - Do not print operational logs to stdout.
@@ -220,6 +264,7 @@ type CachedRdsData = {
 - `list_rds_components` returns non-empty list using mocked docs HTML.
 - `generate_rds_component` returns raw text blob with code and props.
 - `refresh_rds_cache` returns summary JSON and writes cache.
+- `get_component_details` returns enriched metadata for a valid component.
 
 ## 11.3 Runtime checks
 - Stdio mode launches with clean stdout protocol behavior.

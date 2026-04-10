@@ -10,8 +10,13 @@ import type {
   ParsedComponentData,
   RdsComponentMetadata,
   RdsComponentRecord,
+  RdsSectionCacheData,
+  RdsSectionMetadata,
+  RdsSectionRecord,
+  RdsSectionStoryRecord,
   RdsStoryRecord,
   ScrapeRunResult,
+  SectionRunResult,
   ScrapedPagePayload,
   ThemeComplianceReport,
   ThemeComplianceViolation,
@@ -22,7 +27,9 @@ const INDEX_JSON_URL = new URL("index.json", DOCS_ROOT_URL).toString();
 const NAV_PATH_FRAGMENT = "/components/";
 const BASE_THEME_TITLE = "Foundations/Base Theme";
 const BASE_THEME_STORY_PREFIX = "foundations-base-theme--";
-const CACHE_SCHEMA_VERSION = 3;
+const HERO_SECTION_TITLE_PREFIX = "Sections/Hero/";
+const HERO_SECTION_STORY_PREFIX = "sections-hero-";
+const CACHE_SCHEMA_VERSION = 4;
 const GENERIC_INSTALL_FALLBACK =
   "yarn add --registry=https://npm.edpl.us @rds-vue-ui/<component-package>";
 const BATCH_SIZE = 3;
@@ -197,6 +204,92 @@ export class ScraperService implements OnApplicationShutdown {
     } satisfies RdsComponentMetadata;
 
     return metadata;
+  }
+
+  async getRdsSections(options?: {
+    forceRefresh?: boolean;
+    category?: string;
+  }): Promise<SectionRunResult> {
+    const startedAt = Date.now();
+    const forceRefresh = options?.forceRefresh ?? false;
+    const requestedCategory = options?.category?.trim().toLowerCase() ?? "";
+
+    if (!forceRefresh) {
+      const freshCache = await this.cacheService.getFreshCache();
+      const freshSections = freshCache?.sections;
+      if (freshSections) {
+        const filtered = this.filterSectionsByCategory(
+          freshSections,
+          requestedCategory,
+        );
+        return {
+          data: filtered,
+          fromCache: true,
+          usedStaleCache: false,
+          warnings: [],
+          durationMs: Date.now() - startedAt,
+        };
+      }
+    }
+
+    const staleCache = await this.cacheService.readCache();
+    const staleSections = staleCache?.sections ?? null;
+
+    try {
+      const browser = await this.getBrowser();
+      const scraped = await this.scrapeHeroSections(browser);
+      await this.upsertSectionsCache(scraped.sections);
+      const filtered = this.filterSectionsByCategory(
+        scraped.sections,
+        requestedCategory,
+      );
+      return {
+        data: filtered,
+        fromCache: false,
+        usedStaleCache: false,
+        warnings: scraped.warnings,
+        durationMs: Date.now() - startedAt,
+      };
+    } catch (error) {
+      console.error("Failed to scrape sections:", error);
+      if (staleSections) {
+        const filtered = this.filterSectionsByCategory(
+          staleSections,
+          requestedCategory,
+        );
+        return {
+          data: filtered,
+          fromCache: true,
+          usedStaleCache: true,
+          warnings: ["Live section scrape failed; stale section cache served."],
+          durationMs: Date.now() - startedAt,
+        };
+      }
+      throw error;
+    }
+  }
+
+  async getSectionMetadata(
+    sectionRef: string,
+  ): Promise<RdsSectionMetadata | { error: string }> {
+    const normalizedSectionId = this.normalizeSectionRef(sectionRef);
+    if (!normalizedSectionId) {
+      return { error: `Section not found: ${sectionRef}` };
+    }
+
+    const run = await this.getRdsSections();
+    const section = run.data.detailsById[normalizedSectionId];
+    if (!section) {
+      return { error: `Section not found: ${sectionRef}` };
+    }
+
+    return {
+      ...section,
+      sourceMeta: {
+        ...section.sourceMeta,
+        fromCache: run.fromCache,
+      },
+    };
   }
 
   async getBaseThemeGuidelines(
@@ -426,6 +519,7 @@ export class ScraperService implements OnApplicationShutdown {
       }
       const { payloads: pagePayloads, warnings } =
         await this.scrapeComponentPages(browser, components);
+      const sectionResult = await this.scrapeHeroSections(browser);
       const themeResult = await this.scrapeBaseThemeGuidelines(browser);
 
       const detailsById: CachedRdsData["detailsById"] = {};
@@ -439,6 +533,7 @@ export class ScraperService implements OnApplicationShutdown {
         sourceSite: DOCS_ROOT_URL,
         components,
         detailsById,
+        sections: sectionResult.sections,
         themes: {
           baseTheme: themeResult.guidelines,
         },
@@ -450,7 +545,7 @@ export class ScraperService implements OnApplicationShutdown {
         data,
         fromCache: false,
         usedStaleCache: false,
-        warnings: [...warnings, ...themeResult.warnings],
+        warnings: [...warnings, ...sectionResult.warnings, ...themeResult.warnings],
         durationMs: Date.now() - startedAt,
       };
     } catch (error) {
@@ -1051,6 +1146,298 @@ export class ScraperService implements OnApplicationShutdown {
       { key: "version", ok: Boolean(input.version) },
       { key: "description", ok: Boolean(input.description) },
       { key: "lastPublished", ok: Boolean(input.lastPublished) },
+    ];
+
+    const present = required.filter((item) => item.ok).length;
+    const score = Number((present / required.length).toFixed(2));
+    const missing = required.filter((item) => !item.ok).map((item) => item.key);
+    return { score, missing };
+  }
+
+  private filterSectionsByCategory(
+    sections: RdsSectionCacheData,
+    category: string,
+  ): RdsSectionCacheData {
+    if (!category) {
+      return sections;
+    }
+    const filteredIndex = sections.index.filter(
+      (item) => item.category.toLowerCase() === category,
+    );
+    const allowedIds = new Set(filteredIndex.map((item) => item.sectionId));
+    const filteredDetails: Record<string, RdsSectionMetadata> = {};
+    for (const [id, detail] of Object.entries(sections.detailsById)) {
+      if (allowedIds.has(id)) {
+        filteredDetails[id] = detail;
+      }
+    }
+    return {
+      index: filteredIndex,
+      detailsById: filteredDetails,
+    };
+  }
+
+  private normalizeSectionRef(value: string): string {
+    const raw = value.trim();
+    if (!raw) {
+      return "";
+    }
+
+    const lower = raw.toLowerCase();
+    if (lower.startsWith("sections/hero/")) {
+      return this.slugifyValue(raw.split("/").at(-1) ?? "");
+    }
+
+    const storyIdMatch = lower.match(/^sections-hero-(.+)--(docs|primary|examples)$/);
+    if (storyIdMatch?.[1]) {
+      return storyIdMatch[1].trim().toLowerCase();
+    }
+
+    return this.normalizeComponentId(raw);
+  }
+
+  private async upsertSectionsCache(sections: RdsSectionCacheData): Promise<void> {
+    const existing = await this.cacheService.readCache();
+    const data: CachedRdsData = existing ?? {
+      schemaVersion: CACHE_SCHEMA_VERSION,
+      updatedAt: new Date().toISOString(),
+      sourceSite: DOCS_ROOT_URL,
+      components: [],
+      detailsById: {},
+      sections,
+    };
+
+    data.schemaVersion = CACHE_SCHEMA_VERSION;
+    data.updatedAt = new Date().toISOString();
+    data.sourceSite = DOCS_ROOT_URL;
+    data.sections = sections;
+
+    await this.cacheService.writeCache(data);
+  }
+
+  private async scrapeHeroSections(
+    browser: Awaited<ReturnType<typeof chromium.launch>>,
+  ): Promise<{ sections: RdsSectionCacheData; warnings: string[] }> {
+    const warnings: string[] = [];
+    const discovered = await this.discoverHeroSectionsFromIndex();
+    if (discovered.length === 0) {
+      throw new Error("No hero sections found in Storybook index.");
+    }
+
+    const index: RdsSectionRecord[] = [];
+    const detailsById: Record<string, RdsSectionMetadata> = {};
+
+    for (const section of discovered) {
+      const docsResult = section.docs
+        ? await this.scrapeHeroSectionDocs(browser, section.sectionId, section.docs.id)
+        : null;
+      const docsWarnings = docsResult?.parsed?.warnings ?? [];
+      const sectionWarnings = [...docsWarnings];
+
+      if (!section.docs) {
+        sectionWarnings.push("No docs story found for hero section.");
+      }
+      if (!section.primary) {
+        sectionWarnings.push("No primary variant found for hero section.");
+      }
+      if (!section.examples) {
+        sectionWarnings.push("No examples variant found for hero section.");
+      }
+      if (docsResult?.warning) {
+        sectionWarnings.push(docsResult.warning);
+        warnings.push(docsResult.warning);
+      }
+
+      index.push({
+        sectionId: section.sectionId,
+        title: section.title,
+        category: "hero",
+        docsUrl: section.docs
+          ? `${DOCS_ROOT_URL}?path=/docs/${section.docs.id}`
+          : "",
+      });
+
+      detailsById[section.sectionId] = {
+        name: section.name,
+        sectionId: section.sectionId,
+        category: "hero",
+        description: null,
+        docs: section.docs
+          ? {
+              storyId: section.docs.id,
+              url: `${DOCS_ROOT_URL}?path=/docs/${section.docs.id}`,
+              sourceCode: docsResult?.parsed?.sourceCode ?? null,
+              propsColumns: docsResult?.parsed?.propsColumns ?? [],
+              propsRows: docsResult?.parsed?.propsRows ?? [],
+              warnings: docsResult?.parsed?.warnings,
+            }
+          : null,
+        stories: section.stories,
+        variants: {
+          primary: section.primary
+            ? {
+                id: section.primary.id,
+                url: `${DOCS_ROOT_URL}?path=/story/${section.primary.id}`,
+              }
+            : null,
+          examples: section.examples
+            ? {
+                id: section.examples.id,
+                url: `${DOCS_ROOT_URL}?path=/story/${section.examples.id}`,
+              }
+            : null,
+        },
+        sourceMeta: {
+          indexJsonUrl: INDEX_JSON_URL,
+          fetchedAt: new Date().toISOString(),
+          fromCache: false,
+        },
+        metadataCompleteness: this.computeSectionCompleteness({
+          hasDocs: Boolean(section.docs),
+          hasPrimary: Boolean(section.primary),
+          hasExamples: Boolean(section.examples),
+          storiesCount: section.stories.length,
+        }),
+        warnings: sectionWarnings,
+      };
+    }
+
+    index.sort((a, b) => a.sectionId.localeCompare(b.sectionId));
+    return {
+      sections: { index, detailsById },
+      warnings,
+    };
+  }
+
+  private async discoverHeroSectionsFromIndex(): Promise<
+    Array<{
+      sectionId: string;
+      title: string;
+      name: string;
+      docs: RdsSectionStoryRecord | null;
+      primary: RdsSectionStoryRecord | null;
+      examples: RdsSectionStoryRecord | null;
+      stories: RdsSectionStoryRecord[];
+    }>
+  > {
+    const response = await fetch(INDEX_JSON_URL);
+    if (!response.ok) {
+      throw new Error(`Failed to load Storybook index.json: ${response.status}`);
+    }
+
+    const parsed = (await response.json()) as {
+      entries?: Record<
+        string,
+        { id?: string; title?: string; name?: string; type?: string }
+      >;
+    };
+
+    const entries = Object.values(parsed.entries ?? {})
+      .map((entry) => ({
+        id: entry.id?.trim() ?? "",
+        title: entry.title?.trim() ?? "",
+        name: entry.name?.trim() ?? "",
+        type: entry.type?.trim() ?? "unknown",
+      }))
+      .filter((entry) => {
+        const lowerTitle = entry.title.toLowerCase();
+        return (
+          lowerTitle.startsWith(HERO_SECTION_TITLE_PREFIX.toLowerCase()) &&
+          entry.id.startsWith(HERO_SECTION_STORY_PREFIX)
+        );
+      });
+
+    const bySection = new Map<
+      string,
+      {
+        sectionId: string;
+        title: string;
+        name: string;
+        stories: RdsSectionStoryRecord[];
+      }
+    >();
+
+    for (const entry of entries) {
+      const leaf = entry.title.split("/").at(-1) ?? "";
+      const sectionId = this.slugifyValue(leaf);
+      if (!sectionId) {
+        continue;
+      }
+
+      if (!bySection.has(sectionId)) {
+        bySection.set(sectionId, {
+          sectionId,
+          title: entry.title,
+          name: leaf,
+          stories: [],
+        });
+      }
+
+      const isDocs = entry.id.endsWith("--docs");
+      bySection.get(sectionId)?.stories.push({
+        id: entry.id,
+        title: entry.title,
+        name: entry.name,
+        type: entry.type,
+        url: isDocs
+          ? `${DOCS_ROOT_URL}?path=/docs/${entry.id}`
+          : `${DOCS_ROOT_URL}?path=/story/${entry.id}`,
+      });
+    }
+
+    return Array.from(bySection.values())
+      .map((section) => {
+        const docs = section.stories.find((item) => item.id.endsWith("--docs")) ?? null;
+        const primary =
+          section.stories.find((item) => item.id.endsWith("--primary")) ?? null;
+        const examples =
+          section.stories.find((item) => item.id.endsWith("--examples")) ?? null;
+        return {
+          sectionId: section.sectionId,
+          title: section.title,
+          name: section.name,
+          docs,
+          primary,
+          examples,
+          stories: section.stories.sort((a, b) => a.id.localeCompare(b.id)),
+        };
+      })
+      .sort((a, b) => a.sectionId.localeCompare(b.sectionId));
+  }
+
+  private async scrapeHeroSectionDocs(
+    browser: Awaited<ReturnType<typeof chromium.launch>>,
+    sectionId: string,
+    docsStoryId: string,
+  ): Promise<{ parsed: ParsedComponentData | null; warning?: string }> {
+    const docsUrl = `${DOCS_ROOT_URL}?path=/docs/${docsStoryId}`;
+    const scrapeResult = await this.scrapeSingleComponent(browser, {
+      componentId: sectionId,
+      title: this.titleFromSlug(sectionId),
+      url: docsUrl,
+    });
+    if (!scrapeResult.payload) {
+      return {
+        parsed: null,
+        warning: `Failed to scrape hero docs for ${sectionId}.`,
+      };
+    }
+    return {
+      parsed: this.parserService.toParsedData(scrapeResult.payload),
+    };
+  }
+
+  private computeSectionCompleteness(input: {
+    hasDocs: boolean;
+    hasPrimary: boolean;
+    hasExamples: boolean;
+    storiesCount: number;
+  }): { score: number; missing: string[] } {
+    const required = [
+      { key: "docs", ok: input.hasDocs },
+      { key: "primaryVariant", ok: input.hasPrimary },
+      { key: "examplesVariant", ok: input.hasExamples },
+      { key: "stories", ok: input.storiesCount > 0 },
     ];
 
     const present = required.filter((item) => item.ok).length;

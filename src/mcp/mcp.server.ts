@@ -122,6 +122,30 @@ export class McpServerService implements OnApplicationShutdown {
             },
           },
           {
+            name: "list_rds_sections",
+            description: "Returns discovered RDS sections (Hero in Phase 6).",
+            inputSchema: {
+              type: "object",
+              properties: {
+                category: { type: "string" },
+              },
+              additionalProperties: false,
+            },
+          },
+          {
+            name: "get_section_details",
+            description:
+              "Returns full metadata for one RDS section (Hero in Phase 6).",
+            inputSchema: {
+              type: "object",
+              properties: {
+                section: { type: "string" },
+              },
+              required: ["section"],
+              additionalProperties: false,
+            },
+          },
+          {
             name: "get_base_theme_guidelines",
             description:
               "Returns cached/scraped Foundations Base Theme guidelines from RDS Storybook.",
@@ -207,6 +231,8 @@ export class McpServerService implements OnApplicationShutdown {
             const result = {
               componentsDiscovered: run.data.components.length,
               componentsParsed: Object.keys(run.data.detailsById).length,
+              sectionsDiscovered: run.data.sections?.index.length ?? 0,
+              sectionsParsed: Object.keys(run.data.sections?.detailsById ?? {}).length,
               cachePath: this.cacheService.cachePath,
               refreshedAt: run.data.updatedAt,
               durationMs: run.durationMs,
@@ -220,6 +246,34 @@ export class McpServerService implements OnApplicationShutdown {
             const component =
               typeof args?.component === "string" ? args.component : "";
             const result = await this.scraperService.getComponentMetadata(component);
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
+          if (name === "list_rds_sections") {
+            const category =
+              typeof args?.category === "string" ? args.category : "";
+            const run = await this.scraperService.getRdsSections({ category });
+            const updatedAt =
+              run.data.index
+                .map((item) => run.data.detailsById[item.sectionId]?.sourceMeta.fetchedAt)
+                .find((value): value is string => Boolean(value)) ??
+              "";
+            const result = {
+              sections: run.data.index,
+              fromCache: run.fromCache,
+              updatedAt,
+              warnings: run.warnings,
+            };
+            return {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+          }
+
+          if (name === "get_section_details") {
+            const section = typeof args?.section === "string" ? args.section : "";
+            const result = await this.scraperService.getSectionMetadata(section);
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
             };

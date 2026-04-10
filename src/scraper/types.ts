@@ -20,6 +20,7 @@ export type CachedRdsData = {
   sourceSite: string;
   components: RdsComponentRecord[];
   detailsById: Record<string, ParsedComponentData>;
+  sections?: RdsSectionCacheData;
   themes?: {
     baseTheme: BaseThemeGuidelines;
   };
@@ -143,4 +144,64 @@ export type ThemeComplianceReport = {
     storyIds: string[];
     updatedAt: string;
   };
+};
+
+export type RdsSectionRecord = {
+  sectionId: string;
+  title: string;
+  category: string;
+  docsUrl: string;
+};
+
+export type RdsSectionStoryRecord = {
+  id: string;
+  title: string;
+  name: string;
+  type: string;
+  url: string;
+};
+
+export type RdsSectionDocsPayload = {
+  storyId: string;
+  url: string;
+  sourceCode: string | null;
+  propsColumns: string[];
+  propsRows: Array<Record<string, string>>;
+  warnings?: string[];
+};
+
+export type RdsSectionMetadata = {
+  name: string;
+  sectionId: string;
+  category: "hero";
+  description: string | null;
+  docs: RdsSectionDocsPayload | null;
+  stories: RdsSectionStoryRecord[];
+  variants: {
+    primary: { id: string; url: string } | null;
+    examples: { id: string; url: string } | null;
+  };
+  sourceMeta: {
+    indexJsonUrl: string;
+    fetchedAt: string;
+    fromCache: boolean;
+  };
+  metadataCompleteness: {
+    score: number;
+    missing: string[];
+  };
+  warnings: string[];
+};
+
+export type RdsSectionCacheData = {
+  index: RdsSectionRecord[];
+  detailsById: Record<string, RdsSectionMetadata>;
+};
+
+export type SectionRunResult = {
+  data: RdsSectionCacheData;
+  fromCache: boolean;
+  usedStaleCache: boolean;
+  warnings: string[];
+  durationMs: number;
 };

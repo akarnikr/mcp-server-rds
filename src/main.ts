@@ -17,6 +17,7 @@ async function bootstrap(): Promise<void> {
     const app = await NestFactory.create(AppModule, {
       logger: false,
     });
+    app.enableShutdownHooks();
     const mcp = app.get(McpServerService);
     const http = app.getHttpAdapter().getInstance();
 
@@ -50,9 +51,19 @@ async function bootstrap(): Promise<void> {
   const app = await NestFactory.createApplicationContext(AppModule, {
     logger: false,
   });
+  app.enableShutdownHooks();
   const mcp = app.get(McpServerService);
   await mcp.connectStdio();
   console.error("MCP stdio server connected.");
+
+  const shutdown = async (signal: string): Promise<void> => {
+    console.error(`Received ${signal}; shutting down MCP stdio server.`);
+    await app.close();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 void bootstrap().catch((error: unknown) => {

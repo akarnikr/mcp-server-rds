@@ -1,5 +1,5 @@
-import { Injectable } from "@nestjs/common";
-import { chromium, type Frame } from "playwright";
+import { Injectable, type OnApplicationShutdown } from "@nestjs/common";
+import { chromium, type Browser, type Frame } from "playwright";
 
 import { CacheService } from "../common/cache.service.js";
 import { ParserService } from "./parser.service.js";
@@ -19,11 +19,18 @@ const INTER_BATCH_DELAY_MS = 1000;
 const PAGE_TIMEOUT_MS = 20_000;
 
 @Injectable()
-export class ScraperService {
+export class ScraperService implements OnApplicationShutdown {
+  private browser: Browser | null = null;
+  private browserLaunchPromise: Promise<Browser> | null = null;
+
   constructor(
     private readonly cacheService: CacheService,
     private readonly parserService: ParserService,
   ) {}
+
+  async onApplicationShutdown(): Promise<void> {
+    await this.closeBrowser();
+  }
 
   async getRdsData(options?: { forceRefresh?: boolean }): Promise<ScrapeRunResult> {
     const startedAt = Date.now();
@@ -71,28 +78,21 @@ export class ScraperService {
     }
 
     try {
-      const browser = await chromium.launch({ headless: true });
-      try {
-        const scrapeResult = await this.scrapeSingleComponent(
-          browser,
-          resolvedComponent,
-        );
-        if (!scrapeResult.payload) {
-          if (staleCache?.detailsById[normalizedId]) {
-            return {
-              parsed: staleCache.detailsById[normalizedId],
-              fromCache: true,
-            };
-          }
-          return { parsed: null, fromCache: false };
+      const browser = await this.getBrowser();
+      const scrapeResult = await this.scrapeSingleComponent(browser, resolvedComponent);
+      if (!scrapeResult.payload) {
+        if (staleCache?.detailsById[normalizedId]) {
+          return {
+            parsed: staleCache.detailsById[normalizedId],
+            fromCache: true,
+          };
         }
-
-        const parsed = this.parserService.toParsedData(scrapeResult.payload);
-        await this.upsertSingleComponentCache(resolvedComponent, parsed);
-        return { parsed, fromCache: false };
-      } finally {
-        await browser.close();
+        return { parsed: null, fromCache: false };
       }
+
+      const parsed = this.parserService.toParsedData(scrapeResult.payload);
+      await this.upsertSingleComponentCache(resolvedComponent, parsed);
+      return { parsed, fromCache: false };
     } catch (error) {
       console.error(`Failed single component scrape for ${normalizedId}:`, error);
       if (staleCache?.detailsById[normalizedId]) {
@@ -106,40 +106,36 @@ export class ScraperService {
     const staleCache = await this.cacheService.readCache();
 
     try {
-      const browser = await chromium.launch({ headless: true });
-      try {
-        const components = await this.discoverComponents(browser);
-        if (components.length === 0) {
-          throw new Error("Component discovery returned no results.");
-        }
-        const { payloads: pagePayloads, warnings } =
-          await this.scrapeComponentPages(browser, components);
-
-        const detailsById: CachedRdsData["detailsById"] = {};
-        for (const payload of pagePayloads) {
-          detailsById[payload.componentId] = this.parserService.toParsedData(payload);
-        }
-
-        const data: CachedRdsData = {
-          schemaVersion: CACHE_SCHEMA_VERSION,
-          updatedAt: new Date().toISOString(),
-          sourceSite: DOCS_ROOT_URL,
-          components,
-          detailsById,
-        };
-
-        await this.cacheService.writeCache(data);
-
-        return {
-          data,
-          fromCache: false,
-          usedStaleCache: false,
-          warnings,
-          durationMs: Date.now() - startedAt,
-        };
-      } finally {
-        await browser.close();
+      const browser = await this.getBrowser();
+      const components = await this.discoverComponents(browser);
+      if (components.length === 0) {
+        throw new Error("Component discovery returned no results.");
       }
+      const { payloads: pagePayloads, warnings } =
+        await this.scrapeComponentPages(browser, components);
+
+      const detailsById: CachedRdsData["detailsById"] = {};
+      for (const payload of pagePayloads) {
+        detailsById[payload.componentId] = this.parserService.toParsedData(payload);
+      }
+
+      const data: CachedRdsData = {
+        schemaVersion: CACHE_SCHEMA_VERSION,
+        updatedAt: new Date().toISOString(),
+        sourceSite: DOCS_ROOT_URL,
+        components,
+        detailsById,
+      };
+
+      await this.cacheService.writeCache(data);
+
+      return {
+        data,
+        fromCache: false,
+        usedStaleCache: false,
+        warnings,
+        durationMs: Date.now() - startedAt,
+      };
     } catch (error) {
       console.error("Live scrape failed:", error);
       if (staleCache) {
@@ -154,6 +150,41 @@ export class ScraperService {
         };
       }
       throw error;
+    }
+  }
+
+  private async getBrowser(): Promise<Browser> {
+    if (this.browser && this.browser.isConnected()) {
+      return this.browser;
+    }
+
+    if (this.browserLaunchPromise) {
+      return this.browserLaunchPromise;
+    }
+
+    this.browserLaunchPromise = chromium
+      .launch({ headless: true })
+      .then((browser) => {
+        this.browser = browser;
+        return browser;
+      })
+      .finally(() => {
+        this.browserLaunchPromise = null;
+      });
+
+    return this.browserLaunchPromise;
+  }
+
+  private async closeBrowser(): Promise<void> {
+    if (!this.browser) {
+      return;
+    }
+    const browser = this.browser;
+    this.browser = null;
+    try {
+      await browser.close();
+    } catch (error) {
+      console.error("Failed to close Playwright browser during shutdown:", error);
     }
   }
 

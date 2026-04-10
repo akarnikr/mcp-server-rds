@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, type OnApplicationShutdown } from "@nestjs/common";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -14,27 +14,20 @@ import { ScraperService } from "../scraper/scraper.service.js";
 import type { ParsedComponentData } from "../scraper/types.js";
 
 @Injectable()
-export class McpServerService {
-  private readonly server: Server;
+export class McpServerService implements OnApplicationShutdown {
+  private server: Server;
   private sseTransport: SSEServerTransport | null = null;
 
   constructor(
     private readonly scraperService: ScraperService,
     private readonly cacheService: CacheService,
   ) {
-    this.server = new Server(
-      {
-        name: "mcp-server-rds",
-        version: "0.1.0",
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      },
-    );
+    this.server = this.createServer();
+  }
 
-    this.registerHandlers();
+  async onApplicationShutdown(): Promise<void> {
+    await this.closeSseTransport();
+    await this.closeServer();
   }
 
   async connectStdio(): Promise<void> {
@@ -43,6 +36,12 @@ export class McpServerService {
   }
 
   async openSseConnection(res: Response): Promise<void> {
+    if (this.sseTransport) {
+      await this.closeSseTransport();
+      await this.closeServer();
+      this.server = this.createServer();
+    }
+
     this.sseTransport = new SSEServerTransport("/mcp/messages", res);
     await this.server.connect(this.sseTransport);
   }
@@ -58,8 +57,24 @@ export class McpServerService {
     await this.sseTransport.handlePostMessage(req, res);
   }
 
-  private registerHandlers(): void {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+  private createServer(): Server {
+    const server = new Server(
+      {
+        name: "mcp-server-rds",
+        version: "0.1.0",
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      },
+    );
+    this.registerHandlers(server);
+    return server;
+  }
+
+  private registerHandlers(server: Server): void {
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
         tools: [
           {
@@ -97,7 +112,7 @@ export class McpServerService {
       };
     });
 
-    this.server.setRequestHandler(
+    server.setRequestHandler(
       CallToolRequestSchema,
       async (request: CallToolRequest) => {
         try {
@@ -183,6 +198,32 @@ export class McpServerService {
         }
       },
     );
+  }
+
+  private async closeSseTransport(): Promise<void> {
+    if (!this.sseTransport) {
+      return;
+    }
+
+    try {
+      if ("close" in this.sseTransport) {
+        await (this.sseTransport as { close: () => Promise<void> }).close();
+      }
+    } catch (error) {
+      console.error("Failed to close SSE transport during shutdown:", error);
+    } finally {
+      this.sseTransport = null;
+    }
+  }
+
+  private async closeServer(): Promise<void> {
+    try {
+      if ("close" in this.server) {
+        await (this.server as { close: () => Promise<void> }).close();
+      }
+    } catch (error) {
+      console.error("Failed to close MCP server during shutdown:", error);
+    }
   }
 
   private async findComponentDetails(
